@@ -148,7 +148,7 @@ class ImportGR2(Operator):
 
     blender_friendly_skeleton: BoolProperty(
         name="Blender Friendly Skeleton",
-        description="SKELETON (.gr2) FILES ONLY. Does not move, resize, or otherwise\nreshape the original 'Original Skeleton Import' data -- bone head,\ntail and length are all untouched.\n\nRecalculates bone roll consistently across the whole skeleton (instead\nof keeping BioWare's original, per-bone roll values, which are not\naligned to any common axis). This is what makes Local-space rotation\nbehave predictably (no unexpected skewing) and makes X-Mirror editing\nand posing work correctly between Left/Right bone pairs.\n\nEach bone's original roll (in radians) is stored as a custom property\n('gr2_original_roll') so that tools such as .jba animation import can\nstill compensate for the difference later on",
+        description="SKELETON (.gr2) FILES ONLY. DO NOT USE. Does not move, resize, or otherwise\nreshape the original 'Original Skeleton Import' data -- bone head,\ntail and length are all untouched.\n\nRecalculates bone roll consistently across the whole skeleton (instead\nof keeping BioWare's original, per-bone roll values, which are not\naligned to any common axis). This is what makes Local-space rotation\nbehave predictably (no unexpected skewing) and makes X-Mirror editing\nand posing work correctly between Left/Right bone pairs.\n\nEach bone's original roll (in radians) is stored as a custom property\n('gr2_original_roll') so that tools such as .jba animation import can\nstill compensate for the difference later on",
         default=False,
     )
 
@@ -206,6 +206,29 @@ class ImportGR2(Operator):
             return {'RUNNING_MODAL'}
         else:
             return self.execute(context)        
+
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        header, body = layout.panel("SWTOR_IO_GR2_options", default_closed=False)
+        header.label(text="Import Options")
+        if body:
+            body.prop(self, "apply_materials_by_name")
+            body.prop(self, "name_as_filename")
+            body.prop(self, "import_collision")
+            body.prop(self, "blender_friendly_skeleton")
+
+        # Not recommended for modding, so a sub-panel that starts collapsed.
+        # body is None while the sub-panel is collapsed.
+        header, body = layout.panel("SWTOR_IO_GR2_transform", default_closed=True)
+        header.label(text="Import Axis & Scale")
+        if body:
+            body.prop(self, "apply_axis_conversion")
+            body.prop(self, "scale_object")
+            body.prop(self, "scale_factor")
 
 
     def execute(self, context):
@@ -1059,13 +1082,15 @@ def build(gr2,
 
         bpy.ops.object.mode_set(mode='OBJECT')
 
-        if apply_axis_conversion:
+        # Same as for the meshes above: the scale is applied (baked into the bones), so
+        # "import_scale" says how much the armature's data was scaled, not an Object scale.
+        if apply_axis_conversion or scale_object:
             bpy.ops.object.select_all(action='DESELECT')
             ob=bpy.data.objects[armature.name]
             ob.select_set(True)
             bpy.context.view_layer.objects.active = ob
-            bpy.ops.object.transform_apply(location=False, rotation=True, scale=scale_object, properties=True )
-            ob["import_axis_conversion"] = True
+            bpy.ops.object.transform_apply(location=False, rotation=apply_axis_conversion, scale=scale_object, properties=True )
+            ob["import_axis_conversion"] = apply_axis_conversion
         else:
             ob=bpy.data.objects[armature.name]
             ob["import_axis_conversion"] = False

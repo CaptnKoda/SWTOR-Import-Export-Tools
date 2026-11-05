@@ -118,6 +118,24 @@ TAIL_LENGTH = 0.01
 PIN_THRESHOLD = 0.999  # invertedSimWeight at/above this counts as a true, rigid anchor.
 
 
+def armature_baked_scale(armature_ob):
+    # type: (Object) -> float
+    """
+    How much an armature's bone data is scaled up from the .gr2 skeleton's raw units.
+
+    The .gr2 importer's "Scale Object" option applies its factor to the armature, which
+    it records as "import_scale" ("gr2_scale" before it was renamed), so a baked
+    armature has Object scale 1. An armature whose Object scale still carries that
+    factor (imported before the scale was applied, or not yet applied) has raw bones.
+    """
+    scale = armature_ob.get("import_scale", armature_ob.get("gr2_scale", 1.0))
+    if abs(scale - 1.0) < 1e-6:
+        return 1.0
+    if all(abs(c - scale) < 1e-4 for c in armature_ob.scale):
+        return 1.0
+    return scale
+
+
 def _find_pins(cloth):
     # type: (Cloth) -> List[Cloth.Bone]
     """
@@ -378,18 +396,24 @@ def build(operator, context, cloth, filepath):
             bake_rotation = bool(armature_ob["import_axis_conversion"])
         else:
             bake_rotation = bool(armature_ob.get("gr2_axis_conversion", False))  # legacy key, pre-rename
+        baked_scale = armature_baked_scale(armature_ob)
         created_new = False
     else:
         armature_data = bpy.data.armatures.new(os.path.splitext(os.path.basename(filepath))[0] + "_skeleton")
         armature_ob = bpy.data.objects.new(armature_data.name, armature_data)
         context.collection.objects.link(armature_ob)
         bake_rotation = False
+        baked_scale = scale_factor  # Baked into the new bones, like the .gr2 importer does
         created_new = True
 
     pre_rotation = AXIS_CONVERSION_ROTATION if bake_rotation else Matrix.Identity(4)
 
+    # Bone positions are in the .gr2's raw units: scaled to match the armature's own
+    # (an existing armature that was scaled when imported has bigger bones than that).
+    tail_length = TAIL_LENGTH * baked_scale
+
     def to_armature_space(v):
-        return (pre_rotation @ v.to_4d()).to_3d()
+        return (pre_rotation @ v.to_4d()).to_3d() * baked_scale
 
     bpy.ops.object.select_all(action='DESELECT')
     armature_ob.select_set(True)
@@ -496,7 +520,7 @@ def build(operator, context, cloth, filepath):
             head = to_armature_space(_parent_rest_position(pin))
             placeholder_eb = edit_bones.new(real_parent_name)
             placeholder_eb.head = head
-            placeholder_eb.tail = head + Vector((0, TAIL_LENGTH, 0))
+            placeholder_eb.tail = head + Vector((0, tail_length, 0))
             placeholder_eb["clo_placeholder"] = True
             placeholder_of_real_parent[real_parent_name] = placeholder_eb
 
@@ -512,7 +536,7 @@ def build(operator, context, cloth, filepath):
         ) / len(placeholder_of_real_parent)
         master_eb = edit_bones.new(os.path.splitext(os.path.basename(filepath))[0] + "_master")
         master_eb.head = centroid
-        master_eb.tail = centroid + Vector((0, TAIL_LENGTH, 0))
+        master_eb.tail = centroid + Vector((0, tail_length, 0))
         master_eb["clo_master"] = True
         master_eb["clo_real_parents"] = ", ".join(sorted(placeholder_of_real_parent))
         for placeholder_eb in placeholder_of_real_parent.values():
@@ -544,7 +568,7 @@ def build(operator, context, cloth, filepath):
             # tested), so it can't be used as an "outward" direction at all.
             parent_index = effective_parent_of.get(bone.index)
             direction = None
-            segment_length = TAIL_LENGTH
+            segment_length = tail_length
             if parent_index is not None:
                 parent_head = to_armature_space(_bone_rest_position(cloth.bones[parent_index]))
                 incoming = head - parent_head
@@ -555,7 +579,7 @@ def build(operator, context, cloth, filepath):
                 # No parent to extrapolate from either (an isolated pinned particle with
                 # nothing attached) -- arbitrary but harmless, there's nothing to get wrong.
                 direction = Vector((0.0, 1.0, 0.0))
-            eb.tail = head + direction * max(segment_length, TAIL_LENGTH * 0.25)
+            eb.tail = head + direction * max(segment_length, tail_length * 0.25)
 
         # A bone becomes an effective root either because it's a true pin that was chosen
         # to seed the tree, or because every ancestor up to its seed got pruned above (see
@@ -577,7 +601,7 @@ def build(operator, context, cloth, filepath):
                     parent_eb = edit_bones.new(bone.parent)
                     placeholder_head = to_armature_space(_parent_rest_position(bone))
                     parent_eb.head = placeholder_head
-                    parent_eb.tail = placeholder_head + Vector((0, TAIL_LENGTH, 0))
+                    parent_eb.tail = placeholder_head + Vector((0, tail_length, 0))
                     parent_eb["clo_placeholder"] = True
                     operator.report(
                         {'WARNING'},
@@ -612,7 +636,6 @@ def build(operator, context, cloth, filepath):
         armature_ob.matrix_local = AXIS_CONVERSION_ROTATION
         armature_ob["import_axis_conversion"] = False
         armature_ob.data.display_type = 'STICK'
-        armature_ob.scale *= scale_factor
         armature_ob["import_scale"] = scale_factor
 
     if skipped_existing:
