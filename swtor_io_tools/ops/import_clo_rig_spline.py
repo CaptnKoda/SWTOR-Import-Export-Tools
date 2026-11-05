@@ -37,6 +37,7 @@ from mathutils import Matrix
 
 from .import_clo import _find_sibling_mesh
 from .import_clo_rig import (
+    armature_baked_scale,
     _effective_parent,
     _find_pins,
     _find_unweighted_bones,
@@ -360,15 +361,16 @@ def _apply_bendy_bones(armature_ob, cloth, chain, use_spline_ik):
     # default if they're ever visible near a bendy chain; fixing every bone in an external
     # rig this addon doesn't otherwise touch felt like too wide a blast radius for what's
     # actually been reported so far.
+    width = BBONE_WIDTH * armature_baked_scale(armature_ob)  # Bone data units: they scale with the bones
     anchor_bone = bones[cloth.bones[chain[0]].name].parent
     if anchor_bone is not None:
-        anchor_bone.bbone_x = BBONE_WIDTH
-        anchor_bone.bbone_z = BBONE_WIDTH
+        anchor_bone.bbone_x = width
+        anchor_bone.bbone_z = width
 
     for bone in chain_bones:
         bone.bbone_segments = BBONE_SEGMENTS
-        bone.bbone_x = BBONE_WIDTH
-        bone.bbone_z = BBONE_WIDTH
+        bone.bbone_x = width
+        bone.bbone_z = width
 
     if use_spline_ik:
         return
