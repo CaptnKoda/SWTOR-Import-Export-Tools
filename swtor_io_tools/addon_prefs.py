@@ -116,6 +116,16 @@ class Prefs(bpy.types.AddonPreferences):
         default=False,
     )
 
+    jba_import_as_nla: bpy.props.BoolProperty(  # Koda Change
+        name="Import JBA as NLA Track",  # Koda Change
+        description="Biblically Accurate .JBA only. Imports every animation into its own NLA track\n"  # Koda Change
+                    "instead of replacing the armature's active action (any active action is kept,\n"  # Koda Change
+                    "pushed down into an NLA track first). Additive animations (e.g. 'ad_' facial\n"  # Koda Change
+                    "expressions) are layered on top of the others with 'Combine' blending.\n\n"  # Koda Change
+                    "Off: every animation is imported as plain keyframes in the active action",  # Koda Change
+        default=True,  # Koda Change
+    )  # Koda Change
+
     # UI ----------------------------------------
     
     def draw(self, context):        
@@ -159,6 +169,7 @@ class Prefs(bpy.types.AddonPreferences):
         boxcol.scale_y = 0.90
         boxcol.prop(self,'jba_ignore_facial_bones', text="Ignore Facial Bones' Translation Data")
         boxcol.prop(self,'jba_delete_180')
+        boxcol.prop(self,'jba_import_as_nla')  # Koda Change
         boxcol.label()
         boxcol.label(text="The Animation and Character Importers")
         boxcol.label(text="use all the applicable .gr2 Object settings.")

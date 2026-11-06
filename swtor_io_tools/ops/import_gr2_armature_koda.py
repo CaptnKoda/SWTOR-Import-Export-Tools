@@ -1,8 +1,10 @@
 # <pep8 compliant>
 
 """
-"Biblically Accurate .GR2" -- imports a SWTOR skeleton (.gr2) as a Blender
-Armature, keeping every piece of bone data the file holds.
+"Biblically Accurate .GR2" (armatures) -- imports a SWTOR skeleton (.gr2) as
+a Blender Armature, keeping every piece of bone data the file holds.
+
+Skeleton (armature) import only: .gr2 mesh import is kept separate.
 
 Usage:
 File > Import > Biblically Accurate .GR2, then pick one or more skeleton
@@ -33,21 +35,31 @@ parent-relative rest still equals its bone_to_parent exactly.
 
 How this differs from ops/import_gr2.py
 ---------------------------------------
+• Limb-aligned bones. SWTOR (3ds Max Biped) bones run along their local X
+  axis, while a Blender bone always points along its local Y, so with the
+  file's axes as they are, bones point sideways from their limbs. Every
+  bone's rest matrix is therefore the file's turned by the same exact 90°
+  about its own Z axis (LIMB_AXIS_REMAP):
+      Blender X = -file Y,  Blender Y = file X,  Blender Z = file Z
+  Head positions and rest-pose deformation are unchanged; only the axes'
+  names differ. Bones point down their limbs as plain Stick bones, and
+  Blender's X-Mirror works on 26 of bmnnew's 28 Left/Right pairs (1 of 28
+  with the file's axes). The 90° turn is stored on every bone
+  ('gr2_rest_correction') and the armature is flagged
+  'gr2_bone_orientation' = 'LIMB'.
+  .jba animations are authored against the file's axes: import them with
+  ops/import_jba_koda.py ("Biblically Accurate .JBA"), which undoes the turn
+  for the maths and reapplies it to the result. The other .jba importers
+  pose these armatures wrongly.
+
 • Each bone's rest matrix is set directly with EditBone.matrix, so its head
-  position and all three local axes (including roll) are exactly the file's.
-  The existing importer gets the same orientation by a different route, so
-  .jba animations (ops/import_jba_64.py) apply in the same way.
+  position and all three local axes (including roll) are exactly the
+  (turned) file's.
 
-• Bones get real lengths (based on the distance to their children) instead
-  of 1e-5 "dots", so the armature can be seen, selected and posed. A bone's
-  length doesn't affect deformation or animation; only head and orientation
-  do.
-
-• SWTOR (3ds Max Biped) bones run along their local X axis, while a Blender
-  bone always points along its local Y. Turning the bones to follow their
-  chains would change their rest orientation, which breaks animation import.
-  Instead, the optional "Bone Shapes" are display-only custom shapes drawn
-  from each bone toward its child. In Edit Mode, bones show their true axes.
+• Bones get real lengths: a body bone reaches its child along its own axis
+  (see _limb_lengths()); attachment, effect, face and root bones are short
+  Stick bones that read as dots. A bone's length doesn't affect deformation
+  or animation; only head and orientation do.
 
 • Bones whose rest transform is a mirror image (det = -1, e.g. bmnnew's
   vfx_hip_left / vfx_knee_left / vfx_elbow_left) can't be represented by a
@@ -64,8 +76,9 @@ How this differs from ops/import_gr2.py
   properties that ops/import_gr2.py writes (the .jba importers read
   'import_scale').
 
-• Bones are sorted into bone collections (Body / Face / Attachments / Roots)
-  for easier selection. This is cosmetic only.
+• Bones are sorted into bone collections following the hand-sorted rigs in
+  the community's FKArmatures.blend (Primary / Secondary / Face / Weapon /
+  Technical / Bip01) for easier selection. This is cosmetic only.
 
 • Scale Armature is baked into the bone data (head positions only, never
   orientations), so .jba animations scale correctly. ops/import_gr2.py
@@ -81,16 +94,17 @@ How this differs from ops/import_gr2.py
 """
 
 import json
+import math
 import os
 import struct
 from math import pi as PI
-from typing import Dict, List, Optional, Set
+from typing import List, Optional, Set
 
 import bpy
 from bpy import app
-from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, StringProperty
+from bpy.props import BoolProperty, CollectionProperty, FloatProperty, StringProperty
 from bpy.types import Context, Operator, OperatorFileListElement
-from mathutils import Matrix, Quaternion, Vector
+from mathutils import Matrix, Vector
 
 from ..types.shared import job_results  # add-on-wide global-like dict
 
@@ -100,35 +114,50 @@ BLENDER_VERSION = app.version
 GR2_MAGIC = 0x42574147  # 'GAWB'
 GR2_TYPE_SKELETON = 2
 
-BONE_SHAPE_NAME = "WGT_GR2_KodaBone"
-SPHERE_SHAPE_NAME = "WGT_GR2_KodaSphere"
-SPHERE_RADIUS_FACTOR = 0.004  # 'Spheres' display: radius as a fraction of the skeleton's size
-
-# Name prefixes / names of bones that are sockets, effects anchors and other
-# helpers, not part of the body's deforming hierarchy. Only used to sort bones
-# into bone collections and to pick which child a bone's shape points at.
-HELPER_PREFIXES = ("vfx_", "socket_", "attach_")
-HELPER_NAMES = {"Camera", "NamePlate", "FxRoot", "LeftWeapon", "RightWeapon"}
-ROOT_NAMES = {"GrannyRootBone", "Master", "Bip01"}
 FACE_PREFIX = "fc_"
 
-MIN_BONE_LENGTH = 1e-4  # in file units; SWTOR skeletons are ~0.2 units tall
-
-# 'Dots (Stick)' display: every bone's length as a fraction of the skeleton's
-# size. Short enough that Stick bones read as dots at normal zoom levels, but
-# not shorter: Blender derives a bone's direction from its head and tail, so
-# very short bones lose precision. Measured over all 361 skeletons in
-# art/dynamic/spec: 0.0005 and above are as accurate as long bones, while
-# 0.00005 (about the 1e-5 units ops/import_gr2.py uses) is 10x worse.
+# Dot-like bones' length, as a fraction of the skeleton's size. Short enough
+# that Stick bones read as dots at normal zoom levels, but not shorter:
+# Blender derives a bone's direction from its head and tail, so very short
+# bones lose precision. Measured over all 361 skeletons in art/dynamic/spec:
+# 0.0005 and above are as accurate as long bones, while 0.00005 (about the
+# 1e-5 units ops/import_gr2.py uses) is 10x worse.
 STICK_LENGTH_FACTOR = 0.001
 
+# Limb-aligned bone orientation: every bone's rest matrix is the file's,
+# right-multiplied by this fixed 90° rotation (about the bone's own Z), so
+# that the file's local X axis -- the one SWTOR / 3ds Max Biped bones run
+# along -- becomes Blender's bone (Y) axis:
+#     Blender X = -file Y,  Blender Y = file X,  Blender Z = file Z
+# A proper rotation made of exact 0/±1 entries: nothing is approximated.
+LIMB_AXIS_REMAP = Matrix(((0.0, 1.0, 0.0, 0.0),
+                          (-1.0, 0.0, 0.0, 0.0),
+                          (0.0, 0.0, 1.0, 0.0),
+                          (0.0, 0.0, 0.0, 1.0)))
+
+# A body bone reaches its child when the child lies within this angle of the
+# bone's own (remapped) axis, else it's a dot.
+LIMB_MAX_CHILD_ANGLE = 60.0
+
 # Bone collections: name -> theme color palette
+# The same collections, in the same order, as the community's hand-sorted
+# FKArmatures.blend rigs (bfanew ... bmsnew, protocol, dog, tauntaun).
 BONE_COLLECTIONS = {
-    "Roots": 'THEME09',
-    "Body": 'THEME04',
-    "Face": 'THEME03',
-    "Attachments": 'THEME01',
+    "Primary": 'THEME04',     # main body bones: spine, neck, head, limbs, fingers, toes
+    "Secondary": 'THEME03',   # twist / blend / ulna helper bones
+    "Face": 'THEME02',        # fc_* (except fc_wrinkle*)
+    "Weapon": 'THEME01',      # socket_*, Left/RightWeapon
+    "Technical": 'THEME10',   # roots, skirt, camera, nameplate, attach_*, vfx_*, fc_wrinkle*
+    "Bip01": 'THEME09',
 }
+
+# Bones that get sticks; the rest are dots.
+STICK_COLLECTIONS = {"Primary", "Secondary"}
+
+SECONDARY_KEYWORDS = ("Twist", "BlendShoulder", "Ulna")
+WEAPON_NAMES = {"LeftWeapon", "RightWeapon"}
+TECHNICAL_NAMES = {"GrannyRootBone", "RootSpine", "Skirt1", "Skirt2", "Camera", "FxRoot", "NamePlate"}
+TECHNICAL_PREFIXES = ("vfx_", "attach_", "fc_wrinkle")
 
 
 class GR2Bone:
@@ -155,18 +184,19 @@ class GR2Skeleton:
         self.num_attachments = 0
 
 
-class ImportGR2Koda(Operator):
+class ImportGR2ArmatureKoda(Operator):
     """
-    Import a SWTOR skeleton (.gr2) as an Armature,
-    keeping every bone's exact rest transform
+    Import a SWTOR skeleton (.gr2) as an Armature with
+    limb-aligned bones, keeping all of the file's bone data
     """
-    bl_idname = "import_armature.gr2_koda"
+    bl_idname = "import_armature.gr2_armature_koda"
     bl_description = ("Import SWTOR skeleton (.gr2) files as Armatures, keeping all of the file's bone data:\n"
-                      "names, hierarchy and exact rest positions and orientations (roll included).\n\n"
+                      "names, hierarchy and exact rest positions and orientations.\n\n"
+                      "• Bones point down their limbs (each bone's axes are turned 90° so that\n"
+                      "   SWTOR's bone axis, X, is Blender's, Y), and X-Mirror posing works.\n\n"
+                      "• Import animations with Biblically Accurate .JBA: the other .jba\n"
+                      "   importers don't account for the turned axes.\n\n"
                       "• Compatible with both SWTOR 32 and 64-bit files.\n\n"
-                      "• Bones get real lengths and, optionally, display shapes that point\n"
-                      "   at their children, so the skeleton is easy to see and pose.\n\n"
-                      "• Works with the .jba animation importers.\n\n"
                       "• Can import selections of multiple files at once")
     bl_label = "Import Biblically Accurate .GR2"
     bl_options = {'UNDO'}
@@ -192,32 +222,9 @@ class ImportGR2Koda(Operator):
 
     # Importing parameters' properties
 
-    bone_display: EnumProperty(
-        name="Bone Display",
-        description="How bones are drawn in Object and Pose Mode. Display only: it never changes\n"
-                    "the bones' rest transforms, so animations apply the same either way",
-        items=(
-            ('STICK', "Dots (Stick)",
-             "Draw bones as very short Stick bones, which read as dots at normal zoom levels\n"
-             "(the classic SWTOR skeleton import look)"),
-            ('SPHERES', "Spheres",
-             "Draw each bone as a small solid sphere at its head. Looks like 'Dots (Stick)', but\n"
-             "keeps the bones long underneath, which is slightly more accurate (Blender derives\n"
-             "bone directions from head and tail, losing precision on very short bones).\n"
-             "Unlike Stick dots, the spheres grow as you zoom in"),
-            ('SHAPES', "Bone Shapes",
-             "Draw each bone as a shape pointing at its child, following the skeleton's chains.\n"
-             "(SWTOR bones run along their local X axis, while Blender bones point along their\n"
-             "local Y, so without shapes most bones point sideways from their chains)"),
-            ('NATIVE', "Native Bones",
-             "Draw plain Blender bones, pointing along their true local Y axis"),
-        ),
-        default='STICK',
-    )
-
     use_bone_collections: BoolProperty(
         name="Bone Collections",
-        description="Sort bones into colored bone collections (Roots, Body, Face, Attachments)",
+        description="Sort bones into colored bone collections\n(Primary, Secondary, Face, Weapon, Technical, Bip01)",
         default=True,
     )
 
@@ -269,7 +276,6 @@ class ImportGR2Koda(Operator):
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, "bone_display")
         layout.prop(self, "use_bone_collections")
         layout.prop(self, "apply_axis_conversion")
         layout.prop(self, "scale_object")
@@ -425,7 +431,7 @@ def _proper_rotation(matrix, reference):
 
 
 def _import_conversion(operator):
-    # type: (ImportGR2Koda) -> (Matrix, float)
+    # type: (ImportGR2ArmatureKoda) -> (Matrix, float)
     """
     The rotation (axis conversion, if applied to the data) and the uniform
     scale that are baked into the bone data. Both are applied to the rest
@@ -446,82 +452,84 @@ def _convert(matrix, rotation, scale):
     return converted
 
 
-def _is_helper(name):
-    # type: (str) -> bool
-    return name.startswith(HELPER_PREFIXES) or name in HELPER_NAMES
-
-
-def _bone_collection_name(name):
-    # type: (str) -> str
-    if name in ROOT_NAMES:
-        return "Roots"
-    if name.startswith(FACE_PREFIX):
-        return "Face"
-    if _is_helper(name):
-        return "Attachments"
-    return "Body"
-
-
-def _display_targets(skel, rest):
-    # type: (GR2Skeleton, List[Matrix]) -> (List[float], List[Vector])
+def _bone_collection_names(skel):
+    # type: (GR2Skeleton) -> List[str]
     """
-    Works out, per bone, a display length and a world-space direction to
-    draw it in: toward its main child or, for a leaf, onward along its
-    parent's direction. Display only.
+    Each bone's collection, following FKArmatures.blend's hand-sorted rigs.
+    Anything not recognised (creature bones such as Jaw, Tail01, LeftEar)
+    is Primary, as on those rigs' dog and tauntaun.
+    """
+    names = {bone.name for bone in skel.bones}
+    result = []
+    for bone in skel.bones:
+        name = bone.name
+        if name == "Bip01":
+            group = "Bip01"
+        elif name in TECHNICAL_NAMES or name.startswith(TECHNICAL_PREFIXES):
+            group = "Technical"
+        elif name == "Root":
+            # Humanoids: Technical, next to RootSpine. Creatures without a
+            # RootSpine (dog, tauntaun): Root is their main body bone.
+            group = "Technical" if "RootSpine" in names else "Primary"
+        elif name.startswith(FACE_PREFIX):
+            group = "Face"
+        elif name.startswith("socket_") or name in WEAPON_NAMES:
+            group = "Weapon"
+        elif any(keyword in name for keyword in SECONDARY_KEYWORDS):
+            group = "Secondary"
+        else:
+            group = "Primary"
+        result.append(group)
+    return result
+
+
+def _limb_lengths(skel, rest):
+    # type: (GR2Skeleton, List[Matrix]) -> List[float]
+    """
+    Bone lengths. Bones can't be turned toward their children
+    (that would change their orientation), so each body bone is made as long
+    as its main child's distance ALONG its own axis: its tail lands on the
+    child when the child lies on that axis (most limb, spine and finger
+    bones: within 0.6° on bmnnew) and as near to it as possible otherwise.
+    Body bones whose child lies too far off their axis, attachments, effects,
+    face and root bones get dot-sized Stick bones.
     """
     num = len(skel.bones)
     children = [[] for _ in range(num)]
+    subtree = [1] * num
     for bone in skel.bones:
         if bone.parent_index >= 0:
             children[bone.parent_index].append(bone.index)
-
-    # Size of each bone's subtree, to find the main chain at branching bones
-    # (e.g. Chest2 -> Neck rather than a collar).
-    subtree = [1] * num
     for i in reversed(range(num)):
         if skel.bones[i].parent_index >= 0:
             subtree[skel.bones[i].parent_index] += subtree[i]
 
     heads = [m.to_translation() for m in rest]
     overall = max((h - heads[0]).length for h in heads) or 1.0
-    min_length = max(MIN_BONE_LENGTH, overall * 0.01)
+    dot = overall * STICK_LENGTH_FACTOR
+    min_cos = math.cos(math.radians(LIMB_MAX_CHILD_ANGLE))
 
-    lengths = [0.0] * num
-    directions = [None] * num  # type: List[Optional[Vector]]
-
-    for i in range(num):
-        candidates = [c for c in children[i] if (heads[c] - heads[i]).length > min_length * 0.5]
-        main = [c for c in candidates if not _is_helper(skel.bones[c].name)
-                and not skel.bones[c].name.startswith(FACE_PREFIX)]
-        if skel.bones[i].name.startswith(FACE_PREFIX):
-            main = candidates  # e.g. fc_jaw -> its own lip/tongue bones
-        if not main:
+    groups = _bone_collection_names(skel)
+    lengths = [dot] * num
+    has_stick = [False] * num
+    for i, bone in enumerate(skel.bones):
+        if groups[i] not in STICK_COLLECTIONS:
             continue
-        target = max(main, key=lambda c: (subtree[c], (heads[c] - heads[i]).length))
-        offset = heads[target] - heads[i]
-        lengths[i] = offset.length
-        directions[i] = offset.normalized()
-
-    # Leaves (and bones whose children all sit on their head): continue the
-    # parent's direction at a fraction of its length. Parents come first, so
-    # they're always resolved already.
-    for i in range(num):
-        if directions[i] is not None:
-            continue
-        parent = skel.bones[i].parent_index
-        if parent >= 0 and directions[parent] is not None:
-            directions[i] = directions[parent].copy()
-            lengths[i] = lengths[parent] * 0.5
-        else:
-            # No usable parent direction: the bone's own +Y (Blender's native).
-            directions[i] = (rest[i].to_3x3() @ Vector((0.0, 1.0, 0.0))).normalized()
-            lengths[i] = overall * 0.05
-        if (children[i]  # a hub: its children sit on its head (e.g. Root)
-                or _is_helper(skel.bones[i].name) or skel.bones[i].name.startswith(FACE_PREFIX)):
-            lengths[i] = min(lengths[i], overall * 0.03)
-
-    lengths = [max(length, min_length) for length in lengths]
-    return lengths, directions
+        axis = (rest[i].to_3x3() @ Vector((0.0, 1.0, 0.0))).normalized()
+        main = [c for c in children[i] if groups[c] == "Primary"
+                and (heads[c] - heads[i]).length > dot]
+        if main:
+            target = max(main, key=lambda c: (subtree[c], (heads[c] - heads[i]).length))
+            offset = heads[target] - heads[i]
+            along = offset.dot(axis)
+            if along >= offset.length * min_cos:
+                lengths[i] = along
+                has_stick[i] = True
+        elif bone.parent_index >= 0 and has_stick[bone.parent_index] and not children[i]:
+            # Leaf (fingertip, toe, twist bone): half its parent, within reason.
+            lengths[i] = min(lengths[bone.parent_index] * 0.5, overall * 0.03)
+            has_stick[i] = True
+    return [max(length, dot) for length in lengths]
 
 
 def _refine_rolls(armature, blender_names, rest, iterations=3, tolerance=1e-7):
@@ -558,47 +566,8 @@ def _refine_rolls(armature, blender_names, rest, iterations=3, tolerance=1e-7):
         bpy.ops.object.mode_set(mode='OBJECT')
 
 
-def _get_sphere_shape():
-    # type: () -> bpy.types.Object
-    """A solid unit icosphere, centered on the origin (i.e., on the bone's head)."""
-    ob = bpy.data.objects.get(SPHERE_SHAPE_NAME)
-    if ob is not None and ob.type == 'MESH':
-        return ob
-
-    import bmesh
-    mesh = bpy.data.meshes.new(SPHERE_SHAPE_NAME)
-    bm = bmesh.new()
-    bmesh.ops.create_icosphere(bm, subdivisions=2, radius=1.0)
-    bm.to_mesh(mesh)
-    bm.free()
-    ob = bpy.data.objects.new(SPHERE_SHAPE_NAME, mesh)
-    # Not linked to any scene (see _get_bone_shape()).
-    return ob
-
-
-def _get_bone_shape():
-    # type: () -> bpy.types.Object
-    """A wireframe, octahedral bone shape along +Y, from 0 to 1 (Blender's own bone proportions)."""
-    ob = bpy.data.objects.get(BONE_SHAPE_NAME)
-    if ob is not None and ob.type == 'MESH':
-        return ob
-
-    w = 0.1
-    verts = [(0, 0, 0), (0, 1, 0), (-w, w, -w), (w, w, -w), (w, w, w), (-w, w, w)]
-    edges = [(0, 2), (0, 3), (0, 4), (0, 5),
-             (1, 2), (1, 3), (1, 4), (1, 5),
-             (2, 3), (3, 4), (4, 5), (5, 2)]
-    mesh = bpy.data.meshes.new(BONE_SHAPE_NAME)
-    mesh.from_pydata(verts, edges, [])
-    mesh.update()
-    ob = bpy.data.objects.new(BONE_SHAPE_NAME, mesh)
-    # Not linked to any scene: custom shapes don't need to be, and this
-    # keeps it out of the way. Its use as a custom shape keeps it saved.
-    return ob
-
-
 def build(operator, context, filepath, skel):
-    # type: (ImportGR2Koda, Context, str, GR2Skeleton) -> (bpy.types.Object, List[str])
+    # type: (ImportGR2ArmatureKoda, Context, str, GR2Skeleton) -> (bpy.types.Object, List[str])
 
     name = os.path.splitext(os.path.basename(filepath))[0]
 
@@ -613,20 +582,15 @@ def build(operator, context, filepath, skel):
         mirror_axes.append(axis)
 
     rotation, scale = _import_conversion(operator)
-    rest = [_convert(matrix, rotation, scale) for matrix in rest]
-
-    lengths, directions = _display_targets(skel, rest)
-    if operator.bone_display == 'STICK':
-        heads = [matrix.to_translation() for matrix in rest]
-        overall = max((head - heads[0]).length for head in heads) or 1.0
-        lengths = [overall * STICK_LENGTH_FACTOR] * len(rest)
+    rest = [_convert(matrix, rotation, scale) @ LIMB_AXIS_REMAP for matrix in rest]
+    lengths = _limb_lengths(skel, rest)
 
     # Create the armature object
     if context.view_layer.objects.active and bpy.ops.object.mode_set.poll():
         bpy.ops.object.mode_set(mode='OBJECT')
 
     armature = bpy.data.armatures.new(name)
-    armature.display_type = 'STICK' if operator.bone_display == 'STICK' else 'OCTAHEDRAL'
+    armature.display_type = 'STICK'
     ob = bpy.data.objects.new(name, armature)
     ob.show_in_front = True
     context.collection.objects.link(ob)
@@ -675,14 +639,16 @@ def build(operator, context, filepath, skel):
             b["gr2_unknown"] = bone.unknown
         if axis:
             b["gr2_mirror_axis"] = axis
+        # rest = file rest @ this (3x3, row by row), for tools such as
+        # ops/import_jba_koda.py to convert between the two
+        b["gr2_rest_correction"] = [v for row in LIMB_AXIS_REMAP.to_3x3() for v in row]
 
     # Bone collections (Blender 4.0+)
     if operator.use_bone_collections and hasattr(armature, "collections"):
         collections = {}
         for collection_name, palette in BONE_COLLECTIONS.items():
             collections[collection_name] = armature.collections.new(collection_name)
-        for bone, blender_name in zip(skel.bones, blender_names):
-            collection_name = _bone_collection_name(bone.name)
+        for collection_name, blender_name in zip(_bone_collection_names(skel), blender_names):
             b = armature.bones[blender_name]
             collections[collection_name].assign(b)
             b.color.palette = BONE_COLLECTIONS[collection_name]
@@ -690,35 +656,13 @@ def build(operator, context, filepath, skel):
             if not collections[collection_name].bones:
                 armature.collections.remove(collections[collection_name])
 
-    # Display shapes: a bone shape rotated (in bone space) from the bone's
-    # own +Y to its display direction. Bone length is already the display
-    # length, and shapes scale with it.
-    if operator.bone_display == 'SPHERES':
-        shape = _get_sphere_shape()
-        heads = [matrix.to_translation() for matrix in rest]
-        radius = (max((head - heads[0]).length for head in heads) or 1.0) * SPHERE_RADIUS_FACTOR
-        for blender_name in blender_names:
-            pb = ob.pose.bones[blender_name]
-            pb.custom_shape = shape
-            pb.use_custom_shape_bone_size = False  # same size for every bone, whatever its length
-            pb.custom_shape_scale_xyz = (radius, radius, radius)
-
-    if operator.bone_display == 'SHAPES':
-        shape = _get_bone_shape()
-        y_axis = Vector((0.0, 1.0, 0.0))
-        for blender_name, matrix, direction in zip(blender_names, rest, directions):
-            pb = ob.pose.bones[blender_name]
-            local_direction = (matrix.to_3x3().normalized().inverted() @ direction).normalized()
-            pb.custom_shape = shape
-            pb.use_custom_shape_bone_size = True
-            pb.custom_shape_rotation_euler = y_axis.rotation_difference(local_direction).to_euler()
-
     # File-level data (same keys as ops/import_gr2.py where they overlap)
     ob["gr2_version"] = skel.version
     ob["gr2_type_flag"] = skel.type_flag
     ob["gr2_header_bounds"] = skel.header_bounds
     ob["gr2_attachment_bones"] = json.dumps([])
     ob["gr2_import_method"] = "biblically_accurate"
+    ob["gr2_bone_orientation"] = 'LIMB'
 
     # SWTOR is Y-up, Blender is Z-up: same object-level conversion as
     # ops/import_gr2.py, unless Axis Conversion already baked it into the
@@ -738,9 +682,10 @@ def build(operator, context, filepath, skel):
 
 
 def _report_accuracy(operator, skel, ob, blender_names, mirror_count):
-    # type: (ImportGR2Koda, GR2Skeleton, bpy.types.Object, List[str], int) -> str
+    # type: (ImportGR2ArmatureKoda, GR2Skeleton, bpy.types.Object, List[str], int) -> str
     """Checks the built armature against the file's own matrices (scaled/rotated as imported)."""
     rotation, scale = _import_conversion(operator)
+    correction = LIMB_AXIS_REMAP
     bones = ob.data.bones
     max_rest_error = 0.0
     max_local_error = 0.0
@@ -749,12 +694,14 @@ def _report_accuracy(operator, skel, ob, blender_names, mirror_count):
         if "gr2_mirror_axis" in b:
             continue
         expected = _convert(_matrix_from_column_major(bone.root_to_bone).inverted_safe(), rotation, scale)
+        expected = expected @ correction
         actual = b.matrix_local
         max_rest_error = max(max_rest_error, max(abs(actual[r][c] - expected[r][c])
                                                  for r in range(4) for c in range(4)))
         if b.parent and "gr2_mirror_axis" not in b.parent:
             expected_local = _matrix_from_column_major(bone.bone_to_parent)
             expected_local.translation = expected_local.translation * scale
+            expected_local = correction.inverted() @ expected_local @ correction
             actual_local = b.parent.matrix_local.inverted_safe() @ b.matrix_local
             max_local_error = max(max_local_error, max(abs(actual_local[r][c] - expected_local[r][c])
                                                        for r in range(4) for c in range(4)))
@@ -764,7 +711,7 @@ def _report_accuracy(operator, skel, ob, blender_names, mirror_count):
 
 
 def load(operator, context, filepath=""):
-    # type: (ImportGR2Koda, Context, str) -> Optional[bpy.types.Object]
+    # type: (ImportGR2ArmatureKoda, Context, str) -> Optional[bpy.types.Object]
     skel = read(operator, filepath)
     if skel is None:
         return None

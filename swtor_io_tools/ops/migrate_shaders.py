@@ -563,6 +563,7 @@ class SWTOR_OT_migrate_shader(bpy.types.Operator):
         # Captured before the call -- see _migrate_and_report()'s same
         # note; migrate_material() deletes the old material datablock
         # outright on a successful conversion.
+        
         original_name = material.name
         result = migrate_material(material)
         if not result.converted:
