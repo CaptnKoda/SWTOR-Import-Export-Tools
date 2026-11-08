@@ -46,11 +46,14 @@ offsets on top of the rest pose.
 Strips hold their first/last frame outside their range, so a one-pose face
 expression applies to the whole base animation; strips can be moved,
 repeated or faded (influence) in the NLA editor. Additive files are detected
-from their data (see _is_additive()), or can be forced either way.
+by their 'ad_' name, with a warning if their data clearly disagrees (see
+_additive_from_data()), or can be forced either way.
 
 Below, import_jba_64.py's own description:
 
 This script imports Star Wars: The Old Republic 64-bit animations into Blender.
+(Biblically Accurate .JBA also reads 32-bit ones, using import_jba.py's reader:
+see read().)
 
 Usage:
 Run this script from "File->Import" menu and then load the desired JBA animation file.
@@ -129,7 +132,7 @@ BONE_REST_FLIP_CORRECTION = Matrix.Rotation(math.pi, 4, 'Y')
 class ImportJBAKoda(Operator):
     """Import from SWTOR 64-bit JBA file format (.jba), including onto Limb-Aligned armatures"""
     bl_idname = "import_animation.jba_koda"
-    bl_description = "Import and apply an animation to the active SWTOR skeleton in the scene.\n\n• Only compatible with .jba files extracted from SWTOR 64-bit\n   (Game Update 7.2.1 onwards).\n\n• Bone names are read from the game's animation network (.mph)\n   files: either the ones next to the .jba file, or the ones in the\n   Resources Directory set in the Add-on's Preferences\n   (anim/<category>/<rig>, e.g. anim/humanoid/bmnnew, matched\n   by the .jba's folder or the active skeleton's name).\n\n• Might apply exaggerated bone translations requiring cleanup\n   (check ZG SWTOR Tools Add-on's Clear Bones Translations tool).\n\n• Required for armatures imported with Biblically Accurate .GR2\n   (also works on other SWTOR armatures)."
+    bl_description = "Import and apply an animation to the active SWTOR skeleton in the scene.\n\n• Compatible with .jba files from both SWTOR 32-bit and 64-bit\n   (before and after Game Update 7.2.1).\n\n• Bone names are read from the game's animation network (.mph)\n   files: either the ones next to the .jba file, or the ones in the\n   Resources Directory set in the Add-on's Preferences\n   (anim/<category>/<rig>, e.g. anim/humanoid/bmnnew, matched\n   by the .jba's folder or the active skeleton's name).\n\n• Might apply exaggerated bone translations requiring cleanup\n   (check ZG SWTOR Tools Add-on's Clear Bones Translations tool).\n\n• Required for armatures imported with Biblically Accurate .GR2\n   (also works on other SWTOR armatures)."
     bl_label = "Import Biblically Accurate .JBA"
     bl_options = {'UNDO'}
 
@@ -164,8 +167,8 @@ class ImportJBAKoda(Operator):
         description="Whether the .jba holds bone poses or offsets to add on top of a pose",
         items=(
             ('AUTO', "Auto-Detect",
-             "Detect additive animations from their data: in them, bones hold near-zero\n"
-             "translations instead of the skeleton's own bone offsets"),
+             "Additive if the file's name starts with 'ad_' (SWTOR's naming for them).\n"
+             "Warns if the file's data clearly disagrees with its name"),
             ('ABSOLUTE', "Absolute", "The animation holds full bone poses (most animations)"),
             ('ADDITIVE', "Additive",
              "The animation holds offsets added on top of a pose (e.g. bmnnew's 'ad_' facial\n"
@@ -474,9 +477,16 @@ def read(operator, context, filepath):
     # Cancel import if this is not a 64-bit BioWare Austin / SWTOR JBA file
     if dv.byteLength < 4 or dv.getUint32(pos, True) != JBA_64_MAGIC:
         if dv.byteLength >= 4 and dv.getUint32(pos, True) == 0:
-            operator.report({'ERROR'}, f"\'{filepath}\' is a 32-bit SWTOR jba file. Use the 32-bit .jba importer.")
-        else:
-            operator.report({'ERROR'}, f"\'{filepath}\' is not a valid 64-bit SWTOR jba file.")
+            # 32-bit (pre Game Update 7.2.1) file: same keyframe data and the
+            # same JointBoneAnimation result, so import_jba.py's reader is
+            # used as it is, and everything below (build()) applies equally.
+            from .import_jba import read as read_32
+            try:
+                return read_32(operator, filepath)
+            except (AssertionError, IndexError, KeyError, UnicodeDecodeError) as error:
+                operator.report({'ERROR'}, f"\'{filepath}\' couldn't be read as a 32-bit SWTOR jba file ({error}).")
+                return None
+        operator.report({'ERROR'}, f"\'{filepath}\' is not a valid SWTOR jba file.")
         return None
     pos += 4
     pos += 4  # version
@@ -657,29 +667,76 @@ def _file_rest_local(pose_bone):
     return mat_rest
 
 
-def _is_additive(jba, ob, morpheme_space_inv):
-    # type: (JointBoneAnimation, Object, Matrix) -> bool
+def _is_additive_name(anim_name):
+    # type: (str) -> bool
+    """SWTOR's additive animations' names start with 'ad_'."""
+    return anim_name.lower().startswith("ad_")
+
+
+def _additive_from_data(jba, ob, morpheme_space_inv):
+    # type: (JointBoneAnimation, Object, Matrix) -> Optional[bool]
     """
-    Additive .jba files hold zero translation for every bone they don't move,
-    where absolute ones hold the skeleton's own bone-to-parent offsets. So:
-    compare frame 0's translations with this armature's rest offsets, over
-    the bones whose rest offset isn't (nearly) zero. Measured on bmnnew:
-    em_dance_1 (absolute) gives a median ratio of 1.0, the 'ad_' files 0.0.
+    Whether frame 0 of a .jba looks additive (True) or absolute (False), or
+    None when its data doesn't say clearly. Additive files hold identity
+    rotation and zero translation for every bone they don't move; absolute
+    ones hold the skeleton's own rest pose, or near it. Two signals:
+
+    • Rotations, over the bones whose rest rotation is clearly not identity:
+      each votes additive if frame 0 is nearer identity than the rest
+      rotation, absolute otherwise. Decisive with 3+ votes, 75% agreeing.
+    • Translations, over the bones with a rest offset (5+ of them): median
+      |frame 0 translation| / |rest offset| below 0.1 is additive, above 0.5
+      absolute.
+
+    Only an answer both signals give is returned. Each signal alone misjudges
+    some rigs (measured on an 841-file sample over all 354 rigs with a
+    skeleton): translations call some creature clips additive
+    (greebeastterror, rakghoulboss: near-zero translations), and rotations
+    call many placeables' door open/close clips additive (rotated rest
+    poses, identity animation rotations). That's why the 'ad_' name decides,
+    and this only backs a warning when the two disagree (see build()).
     """
+    min_angle = math.radians(5.0)
+    additive_votes = absolute_votes = 0
     ratios = []
     for anim_bone in jba.bones:
         name = getattr(anim_bone, "name", "")
         if name not in ob.pose.bones or not ob.pose.bones[name].parent:
             continue
-        rest_offset = _file_rest_local(ob.pose.bones[name]).to_translation().length
-        if rest_offset < 1e-6:
-            continue
-        offset = (morpheme_space_inv @ Matrix.Translation(anim_bone.translations[0])).to_translation().length
-        ratios.append(offset / rest_offset)
-    if not ratios:
-        return False
-    ratios.sort()
-    return ratios[len(ratios) // 2] < 0.5
+        rest = _file_rest_local(ob.pose.bones[name])
+
+        rest_rotation = rest.to_3x3().normalized()
+        rotation = (morpheme_space_inv @ anim_bone.rotations[0].to_matrix().to_4x4()
+                    @ morpheme_space_inv.inverted()).to_3x3()
+        if rest_rotation.to_quaternion().angle > min_angle:
+            from_identity = rotation.to_quaternion().angle
+            from_rest = (rest_rotation.inverted() @ rotation).to_quaternion().angle
+            if abs(from_identity - from_rest) > min_angle:
+                if from_identity < from_rest:
+                    additive_votes += 1
+                else:
+                    absolute_votes += 1
+
+        rest_offset = rest.to_translation().length
+        if rest_offset >= 1e-6:
+            offset = (morpheme_space_inv @ Matrix.Translation(anim_bone.translations[0])).to_translation().length
+            ratios.append(offset / rest_offset)
+
+    by_rotation = None
+    votes = additive_votes + absolute_votes
+    if votes >= 3 and max(additive_votes, absolute_votes) >= 0.75 * votes:
+        by_rotation = additive_votes > absolute_votes
+
+    by_translation = None
+    if len(ratios) >= 5:
+        ratios.sort()
+        median = ratios[len(ratios) // 2]
+        if median < 0.1:
+            by_translation = True
+        elif median > 0.5:
+            by_translation = False
+
+    return by_rotation if by_rotation is not None and by_rotation == by_translation else None
 
 
 def _is_additive_track(track):
@@ -792,7 +849,12 @@ def build(operator, context, filepath, jba):
     morpheme_space_inv = morpheme_space.inverted()
 
     if operator.animation_type == 'AUTO':
-        additive = _is_additive(jba, ob, morpheme_space_inv)
+        additive = _is_additive_name(anim_name)
+        from_data = _additive_from_data(jba, ob, morpheme_space_inv)
+        if from_data is not None and from_data != additive:
+            operator.report({'WARNING'}, f"'{anim_name}' is named as {'an additive' if additive else 'an absolute'} "
+                                         f"animation, but its data looks {'additive' if from_data else 'absolute'}. "
+                                         "If it comes out wrong, set Animation Type by hand.")
     else:
         additive = operator.animation_type == 'ADDITIVE'
     operator.report({'INFO'}, f"'{anim_name}': {'additive' if additive else 'absolute'} animation")
