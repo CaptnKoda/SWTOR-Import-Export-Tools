@@ -60,6 +60,21 @@ facing, and a jump never leaves the ground. It's keyed onto the armature
 object's Delta Transforms (see _key_world_motion()); on dg_getup_side_1 it
 brings the planted foot's slide from 0.0013 to 0.0001 a frame.
 
+BROKEN FRAMES (add-on preference 'Repair Broken Frames', jba_repair_broken_frames, off by default)
+Some clips (18 broken frames in 16 of bmnnew's normal animations, similar in
+every humanoid body type; e.g. cd_great_forge_all frame 555, right arm) have
+a frame where a "driver" bone, nearly always a shoulder or hip, spins a full
+360° between the frame before and the frame after: an angle wrap in
+BioWare's source data, interpolated the long way round. The middle frame
+catches it halfway, 180° off. Its fingerprint is the stored quaternion sign:
+the exporter keeps every track's sign continuous (consecutive frames
+switch sign only twice in all of bmnnew), and a 360° turn changes q to -q,
+so the neighbours of a broken frame are stored with opposite signs. The rest
+of the limb follows from it: the wrist or ankle flips back to keep the hand
+or foot in place in world space, and helper bones (Ulna, BlendShoulder,
+twist and skirt bones) spike by about half. See _find_broken_frames() for the
+exact test and _repair_broken_frames() for what changes.
+
 READING
 Reading .jba files (32- and 64-bit) and finding their bones' names (from the
 file itself or the rig's Morpheme .mph files) is shared with the regular
@@ -366,6 +381,167 @@ def _rest_correction(bone):
 
 
 # ---------------------------------------------------------------------------
+# Broken frames (see top of file)
+# ---------------------------------------------------------------------------
+
+# How much further (degrees) a frame must be from both neighbours than they
+# are from each other to count as "out and back". Glitches score +40° or
+# more, genuine fast turns 0° or less, so anywhere from 1° to 40° finds
+# nearly the same frames (261-266 bone tracks over all humanoid bodies).
+BROKEN_FRAME_MIN_EXCESS = 20.0
+# A driver's steps just before and after the broken frame must be below
+# this (degrees): genuine weapon twirls spin more than 90° every frame.
+BROKEN_FRAME_MAX_CALM = 60.0
+
+
+def _rotation_angle(a, b):
+    # type: (Quaternion, Quaternion) -> float
+    """The angle (degrees) of the rotation between two orientations, whatever their stored signs."""
+    return math.degrees(2.0 * math.acos(min(1.0, abs(a.dot(b)))))
+
+
+def _out_and_back(before, here, after):
+    # type: (Quaternion, Quaternion, Quaternion) -> bool
+    """Whether 'here' jumps away from both 'before' and 'after' and comes back, rather than moving onward."""
+    return (min(_rotation_angle(before, here), _rotation_angle(here, after))
+            - _rotation_angle(before, after)) > BROKEN_FRAME_MIN_EXCESS
+
+
+def _calm_around(rotations, s):
+    # type: (List[Quaternion], int) -> bool
+    """Whether the bone moves calmly on the steps just before and just after frame s."""
+    steps = []
+    if s >= 2:
+        steps.append(_rotation_angle(rotations[s - 2], rotations[s - 1]))
+    if s + 2 < len(rotations):
+        steps.append(_rotation_angle(rotations[s + 1], rotations[s + 2]))
+    return bool(steps) and max(steps) < BROKEN_FRAME_MAX_CALM
+
+
+def _find_broken_frames(jba):
+    # type: (JointBoneAnimation) -> Set[int]
+    """
+    The (0-based) frames on which some bone, its driver, passes all three tests:
+      1. its stored sign flips across the frame (the frames either side are
+         in opposite hemispheres: a turn of more than 180° in two frames);
+      2. the frame is out and back, not onward motion (rules out genuine
+         fast body turns, which also flip sign);
+      3. the steps around it are calm (rules out weapon twirls).
+    """
+    broken = set()
+    for anim_bone in jba.bones:
+        r = anim_bone.rotations
+        for s in range(1, len(r) - 1):
+            if r[s - 1].dot(r[s + 1]) < 0.0 and _out_and_back(r[s - 1], r[s], r[s + 1]) and _calm_around(r, s):
+                broken.add(s)
+    return broken
+
+
+def _repair_broken_frames(jba, broken, ob, morpheme_space, morpheme_space_inv):
+    # type: (JointBoneAnimation, Set[int], Object, Matrix, Matrix) -> dict
+    """
+    Repairs the broken frames in place, in world space (the file's axes),
+    and returns {frame: [names of the bones whose rotation changed]}.
+
+    In world space a broken frame shows what really went wrong: the driver
+    and everything it carries (the rest of the limb, the helper bones) jump
+    out and back, while the hand or foot at the end of the limb stays where
+    it belongs (its own local flip only cancels the driver's). So on each
+    broken frame, parents first:
+      • a bone whose world orientation is out and back gets the halfway
+        point between the frames either side;
+      • a bone that is out and back only relative to its parent (the hand
+        or foot cancelling the driver, or a helper bone on a fast-moving
+        parent) gets whichever is closer to that halfway pose: its stored
+        world orientation, or the halfway point of its own rotation;
+      • every other bone keeps its own rotation and follows its parent.
+    Only rotations that actually change are written: bones on other limbs,
+    and all translations, are left exactly as stored.
+
+    Bones the file has no track for (roots, sockets) use their rest from the
+    armature; bones the armature doesn't have are never keyed anyway.
+    """
+    index = {anim_bone.name: j for j, anim_bone in enumerate(jba.bones) if anim_bone.name in ob.pose.bones}
+    rest = {}
+
+    def local(name, f):
+        j = index.get(name)
+        if j is not None:
+            return jba.bones[j].rotations[f]
+        if name not in rest:
+            rest[name] = (morpheme_space @ _file_rest_local(ob.pose.bones[name])
+                          @ morpheme_space_inv).to_quaternion()
+        return rest[name]
+
+    def parent_name(name):
+        parent = ob.pose.bones[name].parent
+        return parent.name if parent else None
+
+    def world(name, f, cache):
+        if name not in cache:
+            parent = parent_name(name)
+            cache[name] = (world(parent, f, cache) @ local(name, f)) if parent else local(name, f).copy()
+        return cache[name]
+
+    report = {}
+    # One frame at a time, in order: the frame before is then already
+    # repaired, and the frame after, if it's broken too, is so on another
+    # limb (a bone isn't out and back between a good frame and a broken one).
+    for s in sorted(broken):
+        before_cache, old_cache, after_cache = {}, {}, {}
+        new_world, new_locals = {}, {}
+
+        def repaired_world(name):
+            if name in new_world:
+                return new_world[name]
+            parent = parent_name(name)
+            parent_world = repaired_world(parent) if parent else Quaternion()
+            stored_local = local(name, s)
+            # By default a bone keeps its own (stored, untouched) rotation
+            # and follows its parent.
+            target = parent_world @ stored_local
+            if name in index:
+                old = world(name, s, old_cache)
+                before, after = world(name, s - 1, before_cache), world(name, s + 1, after_cache)
+                if before.dot(after) < 0.0:
+                    after = -after
+                halfway = before.slerp(after, 0.5)
+                local_before, local_after = local(name, s - 1), local(name, s + 1)
+                if _out_and_back(before, old, after):
+                    # The bone itself jumps out and back in world space: the
+                    # driver and the rest of the limb it carries.
+                    target = halfway
+                    new_locals[name] = parent_world.inverted() @ target
+                elif _out_and_back(local_before, stored_local, local_after):
+                    # Out and back only relative to its parent: the end of a
+                    # limb cancelling its driver's flip, or a helper bone
+                    # whose jump is hidden in world space by a fast-moving
+                    # parent (e.g. the torso turning 40°+ a frame). Take
+                    # whichever is closer to the smooth halfway pose: its
+                    # stored world orientation, or the halfway point of its
+                    # own rotation.
+                    if local_before.dot(local_after) < 0.0:
+                        local_after = -local_after
+                    candidate = parent_world @ local_before.slerp(local_after, 0.5)
+                    target = candidate if _rotation_angle(candidate, halfway) < _rotation_angle(old, halfway) else old
+                    new_locals[name] = parent_world.inverted() @ target
+            new_world[name] = target
+            return target
+
+        for name in ob.pose.bones.keys():
+            repaired_world(name)
+        # Written once the whole frame is worked out, from stored data only.
+        names = []
+        for name, rotation in new_locals.items():
+            if _rotation_angle(rotation, local(name, s)) > 0.01:
+                names.append(name)
+                jba.bones[index[name]].rotations[s] = rotation.normalized()
+        if names:
+            report[s] = names
+    return report
+
+
+# ---------------------------------------------------------------------------
 # World motion
 # ---------------------------------------------------------------------------
 
@@ -496,6 +672,20 @@ def build(operator, context, filepath, jba):
     # Layering (see top of file)
     prefs = context.preferences.addons["swtor_io_tools"].preferences
     as_nla_track = getattr(prefs, "jba_import_as_nla", False)
+
+    # Broken frames (see top of file). Additive clips are never touched:
+    # some deliberately hold a different pose on every frame.
+    if getattr(prefs, "jba_repair_broken_frames", False) and not additive:
+        broken = _find_broken_frames(jba)
+        repaired = _repair_broken_frames(jba, broken, ob, morpheme_space, morpheme_space_inv) if broken else {}
+        if repaired:
+            details = []
+            for s in sorted(repaired):
+                frame = (jba.fps * jba.length * s / (jba.num_frames - 1) + 1) if jba.num_frames > 1 else 1
+                details.append(f"frame {round(frame, 2):g} ({', '.join(repaired[s])})")
+            operator.report({'INFO'}, f"'{anim_name}': repaired {len(repaired)} broken "
+                                      f"frame{'s' if len(repaired) > 1 else ''}: " + "; ".join(details))
+
     animation_data = ob.animation_data
     if animation_data.use_tweak_mode:
         animation_data.use_tweak_mode = False

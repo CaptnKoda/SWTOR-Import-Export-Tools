@@ -126,6 +126,18 @@ class Prefs(bpy.types.AddonPreferences):
         default=True,  # Koda Change
     )  # Koda Change
 
+    jba_repair_broken_frames: bpy.props.BoolProperty(  # Koda Change
+        name="Repair Broken Frames",  # Koda Change
+        description="Biblically Accurate .JBA only. Some SWTOR animations have single frames where a\n"  # Koda Change
+                    "shoulder or hip spins a full 360° between two frames (an error in the game's own\n"  # Koda Change
+                    "data), twisting the limb into a broken pose for that one frame. This finds those\n"  # Koda Change
+                    "frames and replaces the affected bones' rotations with the halfway point between\n"  # Koda Change
+                    "the frames either side. Every other bone and frame is left exactly as stored, and\n"  # Koda Change
+                    "the repaired frames are listed after importing. Additive animations are never changed.\n\n"  # Koda Change
+                    "Off: the animation is imported exactly as stored",  # Koda Change
+        default=False,  # Koda Change
+    )  # Koda Change
+
     # UI ----------------------------------------
     
     def draw(self, context):        
@@ -170,6 +182,7 @@ class Prefs(bpy.types.AddonPreferences):
         boxcol.prop(self,'jba_ignore_facial_bones', text="Ignore Facial Bones' Translation Data")
         boxcol.prop(self,'jba_delete_180')
         boxcol.prop(self,'jba_import_as_nla')  # Koda Change
+        boxcol.prop(self,'jba_repair_broken_frames')  # Koda Change
         boxcol.label()
         boxcol.label(text="The Animation and Character Importers")
         boxcol.label(text="use all the applicable .gr2 Object settings.")
