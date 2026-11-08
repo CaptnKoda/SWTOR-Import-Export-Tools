@@ -3,7 +3,7 @@
 bl_info = {
     "name": "SWTOR: Import/Export Tools",
     "author": "Crunch, Darth Atroxa, SWTOR Slicers, Claude",
-    "version": (5, 2, 1),
+    "version": (5, 2, 2),
     "blender": (4, 5, 0),
     "location": "File > Import-Export",
     "description": "Import SWTOR GR2, JBA, CLO Files, and Export SWTOR Compatible GR2 Files",
@@ -34,7 +34,6 @@ from .ops.import_gr2_armature_koda import ImportGR2ArmatureKoda
 from .ops.import_cha             import ImportCHA
 from .ops.import_clo             import ImportCLO
 from .ops.import_jba             import ImportJBA
-from .ops.import_jba_64          import ImportJBA64
 from .ops.import_jba_koda        import ImportJBAKoda
 
 from .types.node         import NODE_OT_ngroup_edit
@@ -125,8 +124,7 @@ def _import_gr2(self, _context):
 
 def _import_jba(self, _context):
     # type: (Menu, Context) -> None
-    self.layout.operator(ImportJBA.bl_idname, text="SWTOR Animations (.jba 32-bit)")
-    self.layout.operator(ImportJBA64.bl_idname, text="SWTOR Animations (.jba 64-bit)")
+    self.layout.operator(ImportJBA.bl_idname, text="SWTOR Animations (.jba 32/64-bit)")
     self.layout.operator(ImportJBAKoda.bl_idname, text="Biblically Accurate .JBA")
 
 def _import_cha(self, _context):
@@ -159,7 +157,6 @@ classes = (
     ImportGR2,
     ImportGR2ArmatureKoda,
     ImportJBA,
-    ImportJBA64,
     ImportJBAKoda,
     NODE_OT_ngroup_edit,
     NODE_MT_swtor_shaders_menu,

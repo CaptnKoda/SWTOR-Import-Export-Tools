@@ -6,12 +6,18 @@ This script imports Star Wars: The Old Republic animations into Blender.
 Usage:
 Run this script from "File->Import" menu and then load the desired JBA animation file.
 
+Both 32-bit and 64-bit .jba files are supported (the format is told from the
+file's first 4 bytes). Reading them is done in types/jba.py; this module finds
+the bones' names when a file has none (see types/mph.py), and applies the
+animation to the active skeleton.
+
 https://github.com/SWTOR-Slicers/WikiPedia/wiki/JBA-File-Structure
 """
 
 import math
 import os
-from typing import Optional, Set
+import re
+from typing import List, Optional, Set
 
 from bpy import app
 from bpy.props import BoolProperty, CollectionProperty, FloatProperty, StringProperty
@@ -19,10 +25,12 @@ from bpy.types import Context, Object, Operator, OperatorFileListElement
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Quaternion, Vector
 
-from ..types.jba import JointBoneAnimation
-from ..utils.binary import ArrayBuffer, DataView
-from ..utils.string import path_split, readCString
+from ..types.jba import JBAError, JointBoneAnimation, read_jba
+from ..types.mph import BONES_FROM_DATA, BONES_FROM_LIBRARY, BONES_INFERRED, MPH_ANIM_LIBRARY_FILE, find_bone_names
+from ..utils.string import path_split
 
+
+NO_ARMATURE_MESSAGE = "No armature selected. Select the skeleton to animate."
 
 # Bones authored with a genuine 180°-around-their-own-Y rest orientation
 # relative to their parent - the classic 3ds Max Biped root-bone convention
@@ -45,9 +53,9 @@ BONE_REST_FLIP_CORRECTION = Matrix.Rotation(math.pi, 4, 'Y')
 
 
 class ImportJBA(Operator):
-    """Import from SWTOR JBA file format (.jba)"""
+    """Import from SWTOR JBA file format (.jba), 32-bit or 64-bit"""
     bl_idname = "import_animation.jba"  # DO NOT CHANGE
-    bl_description = "Import and apply an animation to the active SWTOR skeleton in the scene.\n\n• Only compatible with .jba files extracted from SWTOR 32-bit\n   (before Game Update 7.2.1).\n\n• Might apply exaggerated bone translations requiring cleanup\n   (check ZG SWTOR Tools Add-on's Clear Bones Translations tool)."
+    bl_description = "Import and apply an animation to the active SWTOR skeleton in the scene.\n\n• Compatible with .jba files extracted from SWTOR 32-bit (before Game Update 7.2.1)\n   and from SWTOR 64-bit (Game Update 7.2.1 onwards).\n\n• 64-bit .jba files rarely hold their bones' names. Those are read from the game's\n   animation data (.mph) files: either the ones next to the .jba file, or the ones in the\n   Resources Directory set in the Add-on's Preferences (anim/<category>/<rig>,\n   e.g. anim/humanoid/bmnnew, matched by the .jba's folder or the active skeleton's name).\n\n• Keyframes are placed at their real time in the scene's frame rate. SWTOR animations\n   are 15 or 30 fps: a 30 fps scene puts every keyframe on a whole frame.\n\n• Might apply exaggerated bone translations requiring cleanup\n   (check ZG SWTOR Tools Add-on's Clear Bones Translations tool)."
     bl_label = "Import SWTOR (.jba)"
     bl_options = {'UNDO'}
 
@@ -88,14 +96,29 @@ class ImportJBA(Operator):
     # Animation importing-related properties
     
     ignore_facial_bones: BoolProperty(
-        name="Ignore Facial Transl.",
+        name="Ignore Face Bones",
         description="Ignores the data in the facial bones' translation keyframes\nand only uses their rotation keyframes",
         default=True,
     )
 
     delete_180: BoolProperty(
-        name="Delete 180º rotation",
+        name="Delete 180º Rotation",
         description="Keeps the animation data from turning the skeleton 180º by deleting\nthe keyframes assigned to the Bip01 bone and setting its rotation to zero.\n\nSWTOR animations turn characters so that they face away from the camera,\nas normally shown in the gameplay. That is not just a nuisance but a problem\nwhen adding cloth or physics simulations to capes or lekku: the instantaneous\nturn plays havok with them",
+        default=False,
+    )
+
+    set_scene_fps: BoolProperty(
+        name="Set Scene FPS to 30",
+        description="Sets the scene's frame rate to 30 fps.\n\nThe keyframes are placed at their real time in the scene's frame rate either way. "
+                    "SWTOR animations are 15 or 30 fps, so at 30 fps every keyframe lands on a whole frame (a 15 fps "
+                    "animation on every second one), while other rates, such as Blender's default of 24 fps, put them "
+                    "between frames.\n\nThis changes the whole scene, including cloth simulations",
+        default=False,
+    )
+
+    set_frame_range: BoolProperty(
+        name="Set Frame Range to Animation",
+        description="Sets the scene's Start and End frames to the animation's length",
         default=False,
     )
 
@@ -138,6 +161,30 @@ class ImportJBA(Operator):
             return self.execute(context)        
 
 
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+           
+        # Rarely needed, so a collapsible sub-panel that starts collapsed.
+        # body is None while the sub-panel is collapsed.
+        header, body = layout.panel("SWTOR_IO_JBA_options", default_closed=False)
+        header.label(text="Import Options")
+        if body:
+            body.prop(self, "ignore_facial_bones")
+            body.prop(self, "delete_180")
+            body.prop(self, "set_scene_fps")
+            body.prop(self, "set_frame_range")
+
+        # Rarely needed, so a collapsible sub-panel that starts collapsed.
+        # body is None while the sub-panel is collapsed.
+        header, body = layout.panel("SWTOR_IO_JBA_scale", default_closed=True)
+        header.label(text="Import Scale")
+        if body:
+            body.prop(self, "scale_animation")
+            body.prop(self, "scale_factor")
+
+
     def execute(self, context):
         # type: (Context) -> Set[str]
 
@@ -161,199 +208,95 @@ class ImportJBA(Operator):
         return {'FINISHED'}
 
 
-def _read_rotation_compressed(dv, pos, base, stride):
-    # type: (DataView, int, Vector, Vector) -> Quaternion
-    rot_x_raw = dv.getUint16(pos, True)
-    rot_x = base.x + (rot_x_raw & 32767) * stride.x
-    rot_y = base.y + dv.getUint16(pos + 2, True) * stride.y
-    rot_z = base.z + dv.getUint16(pos + 4, True) * stride.z
-    pos += 6
-    rot_dot = rot_x * rot_x + rot_y * rot_y + rot_z * rot_z
-    rot_w = 0.0 if rot_dot > 1.0 else math.sqrt(1.0 - rot_dot)
+def _find_rig_folders(context, filepath):
+    # type: (Context, str) -> List[str]
+    rig_folders = []
 
-    if rot_x_raw & 32768:
-        rot_w *= -1.0
+    # A .jba still in its extracted location sits next to its networks.
+    jba_folder = os.path.dirname(os.path.abspath(filepath))
+    if any(f.lower().endswith(".mph") for f in os.listdir(jba_folder)):
+        rig_folders.append(jba_folder)
 
-    return Quaternion((rot_w, rot_x, rot_y, rot_z)).normalized()
+    # Otherwise look for <Resources>/anim/<category>/<rig>, where <rig> is
+    # the .jba's folder name (if copied along with it) or the active
+    # skeleton's ("bmnnew_skeleton" or "bmnnew_skeleton.001" -> "bmnnew").
+    rig_names = [os.path.basename(jba_folder)]
+    ob = context.active_object
+    if ob and ob.type == 'ARMATURE':
+        rig_names.append(re.sub(r"(_skeleton)?(\.\d+)?$", "", ob.name))
+
+    prefs = context.preferences.addons["swtor_io_tools"].preferences
+    anim_folder = os.path.join(prefs.swtor_resources_dir, "anim")
+    if prefs.swtor_resources_dir and os.path.isdir(anim_folder):
+        for category in sorted(os.listdir(anim_folder)):
+            for rig_name in rig_names:
+                rig_folder = os.path.join(anim_folder, category, rig_name)
+                if os.path.isdir(rig_folder) and rig_folder not in rig_folders:
+                    rig_folders.append(rig_folder)
+
+    return rig_folders
 
 
-def _read_translation_compressed(dv, pos, base, stride):
-    # type: (DataView, int, Vector, Vector) -> Vector
-    val = dv.getUint32(pos, True)
-    pos += 4
+def _resolve_bone_names(operator, context, filepath, jba):
+    # type: (Operator, Context, str, JointBoneAnimation) -> bool
+    """Finds the bones' names if the file didn't have them. Returns False (after reporting why) if it can't."""
+    anim_name = os.path.splitext(os.path.basename(filepath))[0]
+    num_bones = len(jba.bones)
 
-    pos_x = base.x + (val >> 21) * stride.x
-    pos_y = base.y + ((val >> 10) & 2047) * stride.y
-    pos_z = base.z + (val & 1023) * stride.z
+    if any(bone.name is None for bone in jba.bones):
+        bone_names = None
+        source = None
+        num_layouts = 0
+        rig_folders = _find_rig_folders(context, filepath)
+        for rig_folder in rig_folders:
+            bone_names, source, layouts = find_bone_names(rig_folder, anim_name, num_bones)
+            num_layouts = max(num_layouts, layouts)
+            if bone_names:
+                break
 
-    return Vector((pos_x, pos_y, pos_z))
-
-
-def read(operator, filepath):
-    # type: (Operator, str) -> Optional[JointBoneAnimation]
-    with open(filepath, 'rb') as file:
-        buffer = ArrayBuffer()
-        buffer.fromfile(file, os.path.getsize(filepath))
-
-    dv = DataView(buffer)
-    pos = 0
-
-    # Cancel import if this is not a BioWare Austin / SWTOR JBA file
-    if dv.getUint32(pos, True) != 0:
-        operator.report({'ERROR'}, f"\'{filepath}\' is not a valid SWTOR jba file.")
-        return None
-    pos += 4
-
-    # NOTE: File header
-    length = dv.getFloat32(pos, True)
-    pos += 4
-    fps = dv.getFloat32(pos, True)
-    pos += 4
-    num_blocks = dv.getUint32(pos, True)
-    pos += 4
-    pos += 8  # unknown
-    num_bones = dv.getUint32(pos, True)
-    pos += 4
-    pos += 12  # unknown
-
-    # NOTE: Block headers
-    num_frames = round(length * fps) + 1
-    blocks = [None] * num_blocks
-    for i in range(num_blocks):
-        start_frame = dv.getUint32(pos, True)
-        pos += 4
-        block_size = dv.getUint32(pos, True)
-        pos += 4
-        blocks[i] = JointBoneAnimation.Block(start_frame, block_size)
-        if i > 0:
-            blocks[i - 1].num_frames = 1 + blocks[i].start_frame - blocks[i - 1].start_frame
-        if i + 1 == num_blocks:
-            blocks[i].num_frames = num_frames - blocks[i].start_frame
-    pos += num_blocks * 4  # unknown
-
-    # NOTE: Bone data
-    pos = (pos + 127) & -128
-    bones = [None] * num_bones
-    for i in range(num_bones):
-        translation_stride = Vector([dv.getFloat32(pos + (j * 4), True) for j in range(3)])
-        pos += 12
-        translation_base = Vector([dv.getFloat32(pos + (j * 4), True) for j in range(3)])
-        pos += 12
-        rotation_stride = Vector([dv.getFloat32(pos + (j * 4), True) for j in range(3)])
-        pos += 12
-        rotation_base = Vector([dv.getFloat32(pos + (j * 4), True) for j in range(3)])
-        pos += 12
-        bone = JointBoneAnimation.Bone(rotation_base, rotation_stride, translation_base, translation_stride)
-        bone.rotations = [None] * num_frames
-        bone.translations = [None] * num_frames
-        bones[i] = bone
-
-    # NOTE: Block data
-    pos = (pos + 127) & -128
-    for i in range(num_blocks):
-        block = blocks[i]
-        block_end = pos + block.size
-
-        num_block_bones = dv.getUint32(pos, True)
-        pos += 4
-        assert(num_block_bones == num_bones)
-        pos += 4  # unknown
-
-        # Keyframe layout
-        has_translations = [None] * num_block_bones
-        for j in range(num_block_bones):
-            # num_rotations = dv.getUint32(pos, True)
-            pos += 4
-            pos += 4  # unknown
-            num_translations = dv.getUint32(pos, True)
-            pos += 4
-            pos += 4  # unknown
-            has_translations[j] = num_translations > 0
-
-        # Keyframes
-        for j in range(num_bones):
-            bone = bones[j]
-
-            # Rotations
-            for k in range(block.num_frames):
-                bone.rotations[block.start_frame + k] = _read_rotation_compressed(
-                    dv, pos, bone.rotation_base, bone.rotation_stride)
-                pos += 6
-
-            # Translations
-            pos = (pos + 3) & -4
-            if has_translations[j]:
-                for k in range(block.num_frames):
-                    bone.translations[block.start_frame + k] = _read_translation_compressed(
-                        dv, pos, bone.translation_base, bone.translation_stride)
-                    pos += 4
+        if not bone_names:
+            folders = ", ".join(f"\'{folder}\'" for folder in rig_folders)
+            if not rig_folders:
+                operator.report({'ERROR'}, f"Bone names not found for \'{anim_name}\': the .jba has none and no animation "
+                                           "data (.mph) files were located. Set the Resources Directory in the add-on "
+                                           "preferences and select the skeleton, or import from the extracted "
+                                           "anim/<category>/<rig> folder.")
+            elif num_layouts > 1:
+                operator.report({'ERROR'}, f"Bone names ambiguous for \'{anim_name}\': not listed in the animation data "
+                                           f"(.mph) files in {folders}, which use {num_layouts} different bone orders for "
+                                           f"{num_bones} bones. Not imported, to avoid animating the wrong bones.")
             else:
-                # No translation track for this bone in this block: the
-                # stride quantizes a range that has no samples, so the
-                # correct value is translation_base on its own (raw = 0),
-                # not translation_base plus the stride's maximum quantized
-                # span (see build()'s comment on why translation_base is
-                # never used as an absolute value on its own either way -
-                # this bone will end up with delta == 0, same effect as
-                # any other bone whose track happens not to move).
-                for k in range(block.num_frames):
-                    bone.translations[block.start_frame + k] = bone.translation_base.copy()
+                operator.report({'ERROR'}, f"Bone names not found for \'{anim_name}\' ({num_bones} bones): not listed in "
+                                           f"the animation data (.mph) files in {folders}. If the .jba was renamed, "
+                                           "restore its original name. A 32-bit copy of the animation, if available, "
+                                           "has its own bone names.")
+            return False
 
-        pos = block_end
+        if source == BONES_INFERRED:
+            operator.report({'WARNING'}, f"Bone names inferred for \'{anim_name}\': not listed in the animation data "
+                                         f"(.mph) files, but they use only one bone order for {num_bones} bones. "
+                                         "Verify the result.")
+        else:
+            origin = {BONES_FROM_LIBRARY: MPH_ANIM_LIBRARY_FILE,
+                      BONES_FROM_DATA: "the animation data (.mph) files"}[source]
+            operator.report({'INFO'}, f"Bone names read from {origin}.")
 
-    # World space
-    pos += 4  # unknown
-    # fps = dv.getFloat32(pos, True)
-    pos += 4
-    translation_stride = Vector([dv.getFloat32(pos + (i * 4), True) for i in range(3)])
-    pos += 12
-    translation_base = Vector([dv.getFloat32(pos + (i * 4), True) for i in range(3)])
-    pos += 12
-    rotation_stride = Vector([dv.getFloat32(pos + (i * 4), True) for i in range(3)])
-    pos += 12
-    rotation_base = Vector([dv.getFloat32(pos + (i * 4), True) for i in range(3)])
-    pos += 12
-    num_rotations = dv.getUint32(pos, True)
-    pos += 4
-    assert(num_rotations == num_frames)
-    pos += 4  # unknown
-    # num_translations = dv.getUint32(pos, True)
-    pos += 4
-    # assert(num_translations == num_faces)
-    pos += 4  # unknown
+        for bone, name in zip(jba.bones, bone_names):
+            bone.name = name
 
-    rotations = [_read_rotation_compressed(dv, pos + (i * 8), rotation_base, rotation_stride)
-                 for i in range(num_frames)]
-    pos += num_frames * 6
+    # The skeleton's root bone is named Bip01, not GOD
+    for bone in jba.bones:
+        if bone.name == "GOD":
+            bone.name = "Bip01"
 
-    pos = (pos + 3) & -4
+    return True
 
-    translations = [_read_translation_compressed(dv, pos + (i * 4), translation_base, translation_stride)
-                    for i in range(num_frames)]
-    pos += num_frames * 4
 
-    world_space = JointBoneAnimation.WorldSpace(rotations, translations)
-
-    # Bone names
-    names_start = pos
-    num_names = dv.getUint32(pos, True)
-    pos += 4
-    pos += 4  # unknown
-    # off_indices = dv.getUint32(pos, True)
-    pos += 4
-    # off_offsets = dv.getUint32(pos, True)
-    pos += 4
-    off_names = dv.getUint32(pos, True)
-    pos += 4
-    pos += num_names * 4  # numbers from 0 to num_names - 1
-    name_offsets = [dv.getUint32(pos + (i * 4), True) for i in range(num_names)]
-    pos += num_names * 4
-    bone_names = [readCString(dv, names_start + off_names + name_offsets[i]) for i in range(num_names)]
-
-    for i, name in enumerate(bone_names):
-        bones[i].name = name if name != "GOD" else "Bip01"
-
-    return JointBoneAnimation(length, fps, num_frames, bones, world_space)
+def read(operator, context, filepath):
+    # type: (Operator, Context, str) -> Optional[JointBoneAnimation]
+    """Raises JBAError if the file is corrupt or not supported."""
+    jba = read_jba(filepath)
+    return jba if _resolve_bone_names(operator, context, filepath, jba) else None
 
 
 def build(operator, context, filepath, jba):
@@ -364,8 +307,24 @@ def build(operator, context, filepath, jba):
     ob: Object = context.active_object
 
     if not ob or ob.type != 'ARMATURE':
-        operator.report({'INFO'}, f"Requires object of type Armature to be active, not {ob.type}")
+        operator.report({'ERROR'}, NO_ARMATURE_MESSAGE)
         return False
+
+    animated_bones = [b for b in jba.bones if b.name in ob.pose.bones]
+    if not animated_bones:
+        operator.report({'ERROR'}, f"None of the animation's {len(jba.bones)} bones exist on \'{ob.name}\'. "
+                                   "Select the skeleton this animation is for.")
+        return False
+
+    # SWTOR animations are 15 or 30 fps. Sample i is at i / jba.fps seconds: its keyframe goes
+    # to that time in the scene's frame rate, whatever it is (so, a whole frame only if the
+    # frame rate is a multiple of the animation's).
+    scene = context.scene
+    if operator.set_scene_fps:
+        scene.render.fps = 30
+        scene.render.fps_base = 1.0
+    scene_fps = scene.render.fps / scene.render.fps_base
+    frames_per_sample = scene_fps / jba.fps if jba.fps > 0 else 1.0
 
     # Create armature action
     # anim_name, _ = os.path.splitext(os.path.basename(filepath))
@@ -460,7 +419,7 @@ def build(operator, context, filepath, jba):
                 mat_bone = morpheme_space_inv @ Matrix.Translation(delta) @ mat_rot @ morpheme_space
                 mat_bone.translation = mat_rest.to_translation() + mat_bone.translation
 
-                frame = jba.fps * jba.length * anim_frame / jba.num_frames + 1
+                frame = 1 + anim_frame * frames_per_sample
                 pose_bone.matrix_basis = mat_rest.inverted() @ mat_bone
                 pose_bone.keyframe_insert(data_path="location", frame=frame)
                 if not (operator.delete_180 and bone_name in KNOWN_180_FLIP_BONES):
@@ -481,6 +440,15 @@ def build(operator, context, filepath, jba):
             if bone_name in ob.pose.bones:
                 ob.pose.bones[bone_name].rotation_quaternion = (1, 0, 0, 0)
 
+    if operator.set_frame_range:
+        scene.frame_start = 1
+        scene.frame_end = max(1, math.ceil(1 + (jba.num_frames - 1) * frames_per_sample - 1e-6))
+
+    skipped = len(jba.bones) - len(animated_bones)
+    if skipped:
+        operator.report({'INFO'}, f"{skipped} of the animation's {len(jba.bones)} bones don't exist on "
+                                  f"\'{ob.name}\' and were skipped.")
+
     return True
 
 
@@ -488,11 +456,24 @@ def load(operator, context, filepath=""):
     # type: (Operator, Context, str) -> bool
     from bpy_extras.wm_utils.progress_report import ProgressReport
 
+    # Checked before reading anything: finding bone names can take a while
+    ob = context.active_object
+    if not ob or ob.type != 'ARMATURE':
+        operator.report({'ERROR'}, NO_ARMATURE_MESSAGE)
+        return False
+
     with ProgressReport(context.window_manager) as progress:
         progress.enter_substeps(3, f"Importing \'{filepath}\' ...")
 
         progress.step("Parsing file ...", 1)
-        animation = read(operator, filepath)
+        try:
+            animation = read(operator, context, filepath)
+        except JBAError as e:
+            operator.report({'ERROR'}, str(e))
+            return False
+        except (IndexError, ValueError, OverflowError, OSError):
+            operator.report({'ERROR'}, f"\'{filepath}\' is truncated, corrupt or not supported.")
+            return False
 
         if animation:
             progress.step("Done, building ...", 2)
