@@ -49,6 +49,16 @@ repeated or faded (influence) in the NLA editor. Additive files are detected
 by their 'ad_' name, with a warning if their data clearly disagrees (see
 _additive_from_data()), or can be forced either way.
 
+WORLD MOTION
+Besides the bones, every .jba holds a world-space track: how the game moves
+the whole character while the clip plays (import_jba_64.py reads it but
+never uses it). In bmnnew, 130 of 7211 files actually move it: turns in
+place (po_normal_to_180_cw ...), throne / Force jumps, mount and dismount,
+death falls and get-ups. Without it, a turn snaps back to its starting
+facing, and a jump never leaves the ground. It's keyed onto the armature
+object's Delta Transforms (see _key_world_motion()); on dg_getup_side_1 it
+brings the planted foot's slide from 0.0013 to 0.0001 a frame.
+
 Below, import_jba_64.py's own description:
 
 This script imports Star Wars: The Old Republic 64-bit animations into Blender.
@@ -797,6 +807,72 @@ def _rest_correction(bone):
     return Matrix((values[0:3], values[3:6], values[6:9])).to_4x4()
 
 
+# ---------------------------------------------------------------------------
+# World motion
+# ---------------------------------------------------------------------------
+
+def _key_world_motion(operator, ob, jba, morpheme_space, morpheme_space_inv):
+    # type: (Operator, Object, JointBoneAnimation, Matrix, Matrix) -> None
+    """
+    Keys the .jba's world-space track (the game's own "move the character"
+    channel, separate from the bones: turns in place, throne/Force jumps,
+    mounting, death falls ...) onto the armature object's Delta Transforms,
+    one key per sample on the same frames as the bones. They're keyed for
+    every animation (as identity when the track doesn't move), so switching
+    actions or NLA strips never leaves a previous clip's motion behind, and
+    the object's own Location / Rotation stay the user's.
+
+    The track is converted the same way the bones are (through
+    morpheme_space: Morpheme's Z-up, millimetre-like space into the
+    skeleton's own space), then into the armature's space (the axis
+    conversion, if it was applied to the bone data), and applied in that
+    space on top of the object's current transform:
+        object world = object basis @ world motion
+    Blender composes Delta Transforms as location + delta_location and
+    delta_rotation @ rotation, so for the object's current basis
+    T(loc) R(q) S(s):
+        delta_location = R(q) @ (s * motion translation)
+        delta_rotation = q @ motion rotation @ q^-1
+    """
+    world_space = getattr(jba, "world_space", None)
+    if world_space is None or not world_space.rotations:
+        return
+
+    axis = (Matrix.Rotation(math.pi * 0.5, 4, 'X') if ob.get("import_axis_conversion", False)
+            else Matrix.Identity(4))
+    loc, q, s = ob.matrix_basis.decompose()
+    mode = ob.rotation_mode
+    if mode == 'AXIS_ANGLE':
+        operator.report({'WARNING'}, "Apply World Motion: the armature uses Axis Angle rotation, which has no "
+                                     "delta rotation; only the world motion's translation was keyed.")
+
+    num = min(len(world_space.rotations), len(world_space.translations), jba.num_frames)
+    previous_q = None
+    previous_e = None
+    for i in range(num):
+        frame = (jba.fps * jba.length * i / (jba.num_frames - 1) + 1
+                 if jba.num_frames > 1 else 1)
+        motion = (morpheme_space_inv @ Matrix.Translation(world_space.translations[i])
+                  @ world_space.rotations[i].to_matrix().to_4x4() @ morpheme_space)
+        motion = axis @ motion @ axis.inverted()
+        t = motion.to_translation()
+        ob.delta_location = q @ Vector((t.x * s.x, t.y * s.y, t.z * s.z))
+        ob.keyframe_insert(data_path="delta_location", frame=frame)
+
+        dq = q @ motion.to_quaternion() @ q.inverted()
+        if mode == 'QUATERNION':
+            if previous_q is not None:
+                dq.make_compatible(previous_q)
+            previous_q = dq
+            ob.delta_rotation_quaternion = dq
+            ob.keyframe_insert(data_path="delta_rotation_quaternion", frame=frame)
+        elif mode != 'AXIS_ANGLE':
+            euler = dq.to_euler(mode, previous_e) if previous_e is not None else dq.to_euler(mode)
+            previous_e = euler
+            ob.delta_rotation_euler = euler
+            ob.keyframe_insert(data_path="delta_rotation_euler", frame=frame)
+
+
 def build(operator, context, filepath, jba):
     # type: (Operator, Context, str, JointBoneAnimation) -> bool
     import bpy
@@ -976,6 +1052,8 @@ def build(operator, context, filepath, jba):
         for bone_name in KNOWN_180_FLIP_BONES:
             if bone_name in ob.pose.bones:
                 ob.pose.bones[bone_name].rotation_quaternion = (1, 0, 0, 0)
+
+    _key_world_motion(operator, ob, jba, morpheme_space, morpheme_space_inv)
 
     animation_data.action_blend_type, animation_data.action_influence = saved_blend
 
