@@ -78,7 +78,8 @@ How this differs from ops/import_gr2.py
 
 • Bones are sorted into bone collections following the hand-sorted rigs in
   the community's FKArmatures.blend (Primary / Secondary / Face / Weapon /
-  Technical / Bip01) for easier selection. This is cosmetic only.
+  Technical, plus VFX for the vfx_* effect bones) for easier selection.
+  Bip01 sits in Technical. This is cosmetic only.
 
 • Scale Armature is baked into the bone data (head positions only, never
   orientations), so .jba animations scale correctly. ops/import_gr2.py
@@ -147,8 +148,8 @@ BONE_COLLECTIONS = {
     "Secondary": 'THEME03',   # twist / blend / ulna helper bones
     "Face": 'THEME02',        # fc_* (except fc_wrinkle*)
     "Weapon": 'THEME01',      # socket_*, Left/RightWeapon
-    "Technical": 'THEME10',   # roots, skirt, camera, nameplate, attach_*, vfx_*, fc_wrinkle*
-    "Bip01": 'THEME09',
+    "Technical": 'THEME10',   # Bip01, roots, skirt, camera, nameplate, attach_*, fc_wrinkle*
+    "VFX": 'THEME06',         # vfx_* effect bones
 }
 
 # Bones that get sticks; the rest are dots.
@@ -156,8 +157,9 @@ STICK_COLLECTIONS = {"Primary", "Secondary"}
 
 SECONDARY_KEYWORDS = ("Twist", "BlendShoulder", "Ulna")
 WEAPON_NAMES = {"LeftWeapon", "RightWeapon"}
-TECHNICAL_NAMES = {"GrannyRootBone", "RootSpine", "Skirt1", "Skirt2", "Camera", "FxRoot", "NamePlate"}
-TECHNICAL_PREFIXES = ("vfx_", "attach_", "fc_wrinkle")
+TECHNICAL_NAMES = {"Bip01", "GrannyRootBone", "RootSpine", "Skirt1", "Skirt2", "Camera", "FxRoot", "NamePlate"}
+TECHNICAL_PREFIXES = ("attach_", "fc_wrinkle")
+VFX_PREFIX = "vfx_"
 
 
 class GR2Bone:
@@ -224,7 +226,7 @@ class ImportGR2ArmatureKoda(Operator):
 
     use_bone_collections: BoolProperty(
         name="Bone Collections",
-        description="Sort bones into colored bone collections\n(Primary, Secondary, Face, Weapon, Technical, Bip01)",
+        description="Sort bones into colored bone collections\n(Primary, Secondary, Face, Weapon, Technical, VFX)",
         default=True,
     )
 
@@ -463,8 +465,8 @@ def _bone_collection_names(skel):
     result = []
     for bone in skel.bones:
         name = bone.name
-        if name == "Bip01":
-            group = "Bip01"
+        if name.startswith(VFX_PREFIX):
+            group = "VFX"
         elif name in TECHNICAL_NAMES or name.startswith(TECHNICAL_PREFIXES):
             group = "Technical"
         elif name == "Root":
