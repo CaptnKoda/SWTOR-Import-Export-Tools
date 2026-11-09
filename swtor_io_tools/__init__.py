@@ -30,9 +30,11 @@ from .ops.export_gr2             import ExportGR2
 from .ops.import_area             import ImportAREA
 from .ops.import_fxspec           import ImportFXSPEC
 from .ops.import_gr2             import ImportGR2
+from .ops.import_gr2_armature_koda import ImportGR2ArmatureKoda
 from .ops.import_cha             import ImportCHA
 from .ops.import_clo             import ImportCLO
 from .ops.import_jba             import ImportJBA
+from .ops.import_jba_koda        import ImportJBAKoda
 
 from .types.node         import NODE_OT_ngroup_edit
 from .ops.shaders_menu    import *  # classes and fn for Shader Editor's Add menu functionality
@@ -118,10 +120,12 @@ def _import_fxspec(self, _context):
 def _import_gr2(self, _context):
     # type: (Menu, Context) -> None
     self.layout.operator(ImportGR2.bl_idname, text="SWTOR Objects and Skeletons (.gr2 32/64-bit)")
+    self.layout.operator(ImportGR2ArmatureKoda.bl_idname, text="Biblically Accurate .GR2")
 
 def _import_jba(self, _context):
     # type: (Menu, Context) -> None
     self.layout.operator(ImportJBA.bl_idname, text="SWTOR Animations (.jba 32/64-bit)")
+    self.layout.operator(ImportJBAKoda.bl_idname, text="Biblically Accurate .JBA")
 
 def _import_cha(self, _context):
     # type: (Menu, Context) -> None
@@ -151,7 +155,9 @@ classes = (
     ImportCLO,
     ImportFXSPEC,
     ImportGR2,
+    ImportGR2ArmatureKoda,
     ImportJBA,
+    ImportJBAKoda,
     NODE_OT_ngroup_edit,
     NODE_MT_swtor_shaders_menu,
     NODE_OT_add_swtor_shader_group,
