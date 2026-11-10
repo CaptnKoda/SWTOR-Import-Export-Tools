@@ -122,6 +122,12 @@ class Prefs(bpy.types.AddonPreferences):
         default=False,
     )
 
+    jba_fit_to_armature: bpy.props.BoolProperty(
+        name="Fit to Armature's Proportions",
+        description="Many SWTOR animations were made for a different body type than the one\nthey're filed under (about half of each body's are bmn animations, never\nadapted), so their bone offsets carry that body's proportions. This finds\nthe body each animation was made for, by reading the skeletons in the\nResources Directory's art/dynamic/spec folder, and converts its bone\ntranslations to the armature's own proportions. Animations made for the\narmature's body are used exactly as stored. Additive animations are never\nchanged.\n\nOff: bone translations are used as stored, whichever body they were made for",
+        default=True,
+    )
+
     # UI ----------------------------------------
     
     def draw(self, context):        
@@ -166,6 +172,7 @@ class Prefs(bpy.types.AddonPreferences):
         boxcol.prop(self,'jba_delete_180')
         boxcol.prop(self,'jba_import_as_nla')
         boxcol.prop(self,'jba_repair_broken_frames')
+        boxcol.prop(self,'jba_fit_to_armature')
         boxcol.label()
         boxcol.label(text="The Animation and Character Importers")
         boxcol.label(text="use all the applicable .gr2 Object settings.")

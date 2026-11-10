@@ -28,6 +28,29 @@ into the bone's own axes: basis = C^-1 @ file-axes basis @ C.
 
 Bones without 'gr2_rest_correction' use C = identity (see _rest_correction()).
 
+SOURCE SKELETON (import option 'Fit to Armature's Proportions', on by default; its default is the add-on preference jba_fit_to_armature)
+A .jba stores each bone's translation as its offset from its parent on the
+skeleton the clip was made for, which often isn't the body type it's filed
+under: about half of bfanew's, bfnnew's, bmsnew's and bmfnew's clips still
+carry bmnnew's proportions (copied from bmn, never adapted), and the
+dl_romance_2p_* hugs and kisses were made on bfsnew, in every body's folder.
+Used as stored on another body, those translations pull its joints out of place.
+
+So for absolute clips, _source_offsets() reads the skeleton of every rig in
+the .jba's category (anim/<category>/<rig> -> art/dynamic/spec/<rig>_skeleton.gr2,
+under the Resources Directory or the resources folder the .jba was extracted
+into; nothing is bundled with the add-on) and picks the one whose rest
+offsets match the most bones that hold still for the whole clip. Bones that
+hold a pose (weapons, LowerBack ...) differ from every skeleton alike, so they
+don't sway the choice. This armature wins ties. Each bone's translation is then
+    this armature's rest offset + (stored - source skeleton's rest offset)
+which is the stored value when the clip was made for this armature. The
+reference is the same for every clip, so consecutive clips still meet where
+their data does. (This replaces "rest offset + (stored - translation_base)":
+translation_base is only the bottom of each clip's compression range, so every
+clip was shifted by its own amount, and poses held for a whole clip were lost.)
+If no skeletons are found, translations are used as stored, with a warning.
+
 ADDITIVE ANIMATIONS
 Some .jba files (in bmnnew, the 1060 'ad_' ones: facial expressions, aim and
 yaw offsets ...) are additive: they don't hold bone poses but offsets to be
@@ -95,7 +118,7 @@ https://github.com/SWTOR-Slicers/WikiPedia/wiki/JBA-File-Structure
 import math
 import os
 import re
-from typing import List, Optional, Set
+from typing import List, Optional, Sequence, Set, Tuple
 
 from bpy import app
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, StringProperty
@@ -214,6 +237,12 @@ class ImportJBA(Operator):
         default=False,
     )
 
+    fit_to_armature: BoolProperty(
+        name="Fit to Armature's Proportions",
+        description="Many SWTOR animations were made for a different body type than the one\nthey're filed under (about half of each body's are bmn animations, never\nadapted), so their bone offsets carry that body's proportions. This finds\nthe body each animation was made for, by reading the skeletons in the\nResources Directory's art/dynamic/spec folder, and converts its bone\ntranslations to the armature's own proportions. Animations made for the\narmature's body are used exactly as stored. Additive animations are never\nchanged.\n\nOff: bone translations are used as stored, whichever body they were made for",
+        default=True,
+    )
+
     set_scene_fps: BoolProperty(
         name="Set Scene FPS to 30",
         description="Sets the scene's frame rate to 30 fps.\n\nThe keyframes are placed at their real time in the scene's frame rate either way. "
@@ -257,6 +286,7 @@ class ImportJBA(Operator):
         self.delete_180          = prefs.jba_delete_180
         self.import_as_nla       = prefs.jba_import_as_nla
         self.repair_broken_frames = prefs.jba_repair_broken_frames
+        self.fit_to_armature     = prefs.jba_fit_to_armature
         self.scale_animation     = prefs.gr2_scale_object
         self.scale_factor        = prefs.gr2_scale_factor
 
@@ -285,6 +315,7 @@ class ImportJBA(Operator):
             body.prop(self, "delete_180")
             body.prop(self, "import_as_nla")
             body.prop(self, "repair_broken_frames")
+            body.prop(self, "fit_to_armature")
             body.prop(self, "set_scene_fps")
             body.prop(self, "set_frame_range")
 
@@ -721,11 +752,250 @@ def _repair_broken_frames(jba, broken, ob, morpheme_space, morpheme_space_inv):
 
 
 # ---------------------------------------------------------------------------
+# Source skeleton (see top of file)
+# ---------------------------------------------------------------------------
+
+# A bone "holds still" if its stored translation moves less than this over
+# the whole clip, and its still translation "matches" a skeleton's rest offset
+# if it's within SOURCE_MATCH_RELATIVE of that offset's length or
+# SOURCE_MATCH_ABSOLUTE, whichever is larger. Both absolute values are in
+# unscaled skeleton units (they're multiplied by the import scale).
+STILL_TOLERANCE = 1e-4
+SOURCE_MATCH_RELATIVE = 0.02
+SOURCE_MATCH_ABSOLUTE = 1e-3
+
+# {skeleton path: (modification time, {bone name: unscaled rest offset})}
+_skeleton_offsets_cache = {}
+
+
+class _QuietReporter:
+    """Stands in for an operator when reading a skeleton: a skeleton that can't be read is just skipped."""
+
+    def report(self, *args):
+        pass
+
+
+def _skeleton_rest_offsets(filepath):
+    # type: (str) -> Optional[dict]
+    """
+    A skeleton .gr2's rest offsets, {bone name: translation from its parent},
+    in the file's own (unscaled) units, worked out the way the armature
+    importer builds its rests (ops/import_gr2_armature.py), so that they
+    compare directly with _file_rest_local() on one of its armatures. None if
+    the file can't be read.
+    """
+    try:
+        mtime = os.path.getmtime(filepath)
+    except OSError:
+        return None
+    cached = _skeleton_offsets_cache.get(filepath)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    from .import_gr2 import read as read_gr2
+    from .import_gr2_armature import _matrix_from_column_major, _proper_rotation
+
+    try:
+        gr2 = read_gr2(_QuietReporter(), filepath)
+        bones = [gr2.bone_buffer[i] for i in range(len(gr2.bone_buffer))] if gr2 else []
+        rest = []
+        for bone in bones:
+            matrix = _matrix_from_column_major(bone.root_to_bone).inverted_safe()
+            parent = bone.parent_index
+            reference = rest[parent] if 0 <= parent < len(rest) else Matrix.Identity(4)
+            matrix, _ = _proper_rotation(matrix, reference)
+            rest.append(matrix)
+        offsets = {}
+        for bone, matrix in zip(bones, rest):
+            parent = bone.parent_index
+            local = rest[parent].inverted_safe() @ matrix if 0 <= parent < len(rest) else matrix
+            offsets.setdefault("Bip01" if bone.name == "GOD" else bone.name, local.to_translation())
+    except Exception:  # a skeleton that can't be read is skipped, never fails the import
+        offsets = None
+    if not offsets:
+        offsets = None
+
+    _skeleton_offsets_cache[filepath] = (mtime, offsets)
+    return offsets
+
+
+def _source_skeleton_paths(context, filepath):
+    # type: (Context, str) -> List[Tuple[str, str]]
+    """
+    [(rig name, skeleton path)] for every rig in the .jba's animation category
+    that has a skeleton: each folder next to the .jba's rig folder in
+    anim/<category>/ (bfanew, bmnnew ... in anim/humanoid) whose
+    art/dynamic/spec/<rig>_skeleton.gr2 exists, under the Resources Directory
+    or the resources folder the .jba was extracted into.
+    """
+    resources_roots = []
+    jba_folder = os.path.dirname(os.path.abspath(filepath))
+    category_folder = os.path.dirname(jba_folder)
+    if os.path.basename(os.path.dirname(category_folder)).lower() == "anim":
+        resources_roots.append(os.path.dirname(os.path.dirname(category_folder)))
+    prefs = context.preferences.addons["swtor_io_tools"].preferences
+    if prefs.swtor_resources_dir:
+        resources_roots.append(os.path.abspath(prefs.swtor_resources_dir))
+
+    category_folders = []
+    for rig_folder in _find_rig_folders(context, filepath):
+        category = os.path.dirname(os.path.abspath(rig_folder))
+        if category not in category_folders:
+            category_folders.append(category)
+
+    found = []
+    seen = set()
+    for category in category_folders:
+        try:
+            rig_names = sorted(name for name in os.listdir(category) if os.path.isdir(os.path.join(category, name)))
+        except OSError:
+            continue
+        for rig_name in rig_names:
+            if rig_name in seen:
+                continue
+            for root in resources_roots:
+                path = os.path.join(root, "art", "dynamic", "spec", f"{rig_name}_skeleton.gr2")
+                if os.path.isfile(path):
+                    found.append((rig_name, path))
+                    seen.add(rig_name)
+                    break
+    return found
+
+
+def _source_offsets(operator, context, filepath, jba, ob, scale, anim_name):
+    # type: (Operator, Context, str, JointBoneAnimation, Object, float, str) -> dict
+    """
+    Finds the skeleton the clip was made for (see top of file) and returns, per
+    bone, what to add to its stored translation to fit this armature instead:
+    {bone name: this armature's rest offset - the source skeleton's}, in the
+    armature's units. Empty when the clip was made for this armature (or no
+    skeletons were found): the stored translations are then used as they are.
+    """
+    import_scale = 1000.0 / scale  # skeleton units -> armature units (see morpheme_space in build())
+    still_tolerance = STILL_TOLERANCE * import_scale
+    absolute_match = SOURCE_MATCH_ABSOLUTE * import_scale
+    axis = (Matrix.Rotation(math.pi * 0.5, 4, 'X') if ob.get("import_axis_conversion", False)
+            else Matrix.Identity(4))
+
+    # The armature's own rest offsets, and the clip's still bones (both in armature units)
+    morpheme_space_inv = Matrix(((scale, 0, 0), (0, 0, -scale), (0, scale, 0))).inverted()
+    target = {}
+    still = {}
+    for anim_bone in jba.bones:
+        name = getattr(anim_bone, "name", "")
+        if name not in ob.pose.bones or name in still:
+            continue
+        translations = anim_bone.translations
+        first = translations[0]
+        if all((t - first).length / scale < still_tolerance for t in translations):
+            target[name] = _file_rest_local(ob.pose.bones[name]).to_translation()
+            still[name] = morpheme_space_inv @ first
+    if not still:
+        return {}
+
+    def matches(offsets):
+        # type: (dict) -> int
+        count = 0
+        for name, translation in still.items():
+            offset = offsets.get(name)
+            if offset is not None and (translation - offset).length <= max(SOURCE_MATCH_RELATIVE * offset.length,
+                                                                             absolute_match):
+                count += 1
+        return count
+
+    candidates = []
+    for rig_name, path in _source_skeleton_paths(context, filepath):
+        offsets = _skeleton_rest_offsets(path)
+        if not offsets:
+            continue
+        scaled = {}
+        for name, offset in offsets.items():
+            if name in ob.pose.bones:
+                scaled[name] = offset * import_scale
+                if not ob.pose.bones[name].parent:
+                    scaled[name] = axis.to_3x3() @ scaled[name]
+        candidates.append((rig_name, scaled))
+
+    target_matches = matches(target)
+    if not candidates:
+        operator.report({'WARNING'}, f"'{anim_name}': no skeletons found in art/dynamic/spec to check which body the "
+                                     "clip was made for (set the Resources Directory in the add-on preferences). Bone "
+                                     "translations used as stored: a clip made for another body type keeps that "
+                                     "body's proportions.")
+        return {}
+
+    # This armature wins ties: a clip that fits it is used exactly as stored.
+    best_name, best_offsets, best_matches = None, target, target_matches
+    for rig_name, offsets in candidates:
+        count = matches(offsets)
+        if count > best_matches:
+            best_name, best_offsets, best_matches = rig_name, offsets, count
+
+    if best_name is None:
+        operator.report({'INFO'}, f"'{anim_name}': made for this armature ({target_matches} of {len(still)} still "
+                                  "bones match its rest pose); bone translations used as stored.")
+        return {}
+
+    operator.report({'INFO'}, f"'{anim_name}': made for {best_name} ({best_matches} of {len(still)} still bones match "
+                              f"its rest pose, {target_matches} match this armature's); bone translations converted "
+                              "to this armature's proportions.")
+    return {name: target_offset - best_offsets[name]
+            for name, target_offset in ((n, _file_rest_local(ob.pose.bones[n]).to_translation())
+                                        for n in best_offsets if n in ob.pose.bones)}
+
+
+# ---------------------------------------------------------------------------
+# Keyframes
+# ---------------------------------------------------------------------------
+
+def _new_key_types(context):
+    # type: (Context) -> Tuple[int, int]
+    """The interpolation and handle type (as foreach_set() values) that keyframe_insert() gives new keys: the user's preferences."""
+    from bpy.types import Keyframe
+    edit = context.preferences.edit
+    props = Keyframe.bl_rna.properties
+    return (props["interpolation"].enum_items[edit.keyframe_new_interpolation_type].value,
+            props["handle_left_type"].enum_items[edit.keyframe_new_handle_type].value)
+
+
+def _key_channels(action, ob, key_types, data_path, group_name, frames, values):
+    # type: (bpy.types.Action, Object, Tuple[int, int], str, str, List[float], List[Sequence[float]]) -> None
+    """
+    Keys values[i] (one value per array index of data_path) on frames[i], in
+    bulk: the same keys keyframe_insert() would make (Bezier, auto clamped
+    handles, or whatever the user's preferences say (key_types: see
+    _new_key_types()), grouped by bone), but written all at once into each F-curve
+    instead of one keyframe_insert() call per frame and channel, which is
+    what made importing long animations take many seconds.
+    """
+    num = len(frames)
+    if not num:
+        return
+    for index in range(len(values[0])):
+        fcurve = action.fcurve_ensure_for_datablock(ob, data_path, index=index, group_name=group_name)
+        points = fcurve.keyframe_points
+        if len(points):  # not expected on a new action: keep keyframe_insert()'s replace-on-same-frame behaviour
+            for frame, value in zip(frames, values):
+                points.insert(frame, value[index], options={'REPLACE', 'FAST'})
+        else:
+            co = [0.0] * (2 * num)
+            co[0::2] = frames
+            co[1::2] = [value[index] for value in values]
+            points.add(num)
+            points.foreach_set("co", co)
+            interpolation, handle_type = key_types
+            points.foreach_set("interpolation", [interpolation] * num)
+            points.foreach_set("handle_left_type", [handle_type] * num)
+            points.foreach_set("handle_right_type", [handle_type] * num)
+        fcurve.update()
+
+
+# ---------------------------------------------------------------------------
 # World motion
 # ---------------------------------------------------------------------------
 
-def _key_world_motion(operator, ob, jba, morpheme_space, morpheme_space_inv, frames_per_sample):
-    # type: (Operator, Object, JointBoneAnimation, Matrix, Matrix, float) -> None
+def _key_world_motion(operator, ob, jba, morpheme_space, morpheme_space_inv, frames_per_sample, key_types):
+    # type: (Operator, Object, JointBoneAnimation, Matrix, Matrix, float, Tuple[int, int]) -> None
     """
     Keys the .jba's world-space track (the game's own "move the character"
     channel, separate from the bones: turns in place, throne/Force jumps,
@@ -760,29 +1030,41 @@ def _key_world_motion(operator, ob, jba, morpheme_space, morpheme_space_inv, fra
                                      "delta rotation; only the world motion's translation was keyed.")
 
     num = min(len(world_space.rotations), len(world_space.translations), jba.num_frames)
+    axis_inv = axis.inverted()
+    q_inv = q.inverted()
+    frames = [1 + i * frames_per_sample for i in range(num)]
+    locations = []
+    rotations = []
     previous_q = None
     previous_e = None
     for i in range(num):
-        frame = 1 + i * frames_per_sample
         motion = (morpheme_space_inv @ Matrix.Translation(world_space.translations[i])
                   @ world_space.rotations[i].to_matrix().to_4x4() @ morpheme_space)
-        motion = axis @ motion @ axis.inverted()
+        motion = axis @ motion @ axis_inv
         t = motion.to_translation()
-        ob.delta_location = q @ Vector((t.x * s.x, t.y * s.y, t.z * s.z))
-        ob.keyframe_insert(data_path="delta_location", frame=frame)
+        locations.append(q @ Vector((t.x * s.x, t.y * s.y, t.z * s.z)))
 
-        dq = q @ motion.to_quaternion() @ q.inverted()
+        dq = q @ motion.to_quaternion() @ q_inv
         if mode == 'QUATERNION':
             if previous_q is not None:
                 dq.make_compatible(previous_q)
             previous_q = dq
-            ob.delta_rotation_quaternion = dq
-            ob.keyframe_insert(data_path="delta_rotation_quaternion", frame=frame)
+            rotations.append(dq)
         elif mode != 'AXIS_ANGLE':
             euler = dq.to_euler(mode, previous_e) if previous_e is not None else dq.to_euler(mode)
             previous_e = euler
-            ob.delta_rotation_euler = euler
-            ob.keyframe_insert(data_path="delta_rotation_euler", frame=frame)
+            rotations.append(euler)
+
+    # As keyframe_insert() would, the object is left showing the last frame.
+    action = ob.animation_data.action
+    ob.delta_location = locations[-1]
+    _key_channels(action, ob, key_types, "delta_location", "Object Transforms", frames, locations)
+    if mode == 'QUATERNION':
+        ob.delta_rotation_quaternion = rotations[-1]
+        _key_channels(action, ob, key_types, "delta_rotation_quaternion", "Object Transforms", frames, rotations)
+    elif mode != 'AXIS_ANGLE':
+        ob.delta_rotation_euler = rotations[-1]
+        _key_channels(action, ob, key_types, "delta_rotation_euler", "Object Transforms", frames, rotations)
 
 
 def build(operator, context, filepath, jba):
@@ -879,6 +1161,13 @@ def build(operator, context, filepath, jba):
             operator.report({'INFO'}, f"'{anim_name}': repaired {len(repaired)} broken "
                                       f"frame{'s' if len(repaired) > 1 else ''}: " + "; ".join(details))
 
+    # The skeleton the clip was made for (see top of file). Additive clips hold
+    # offsets, not a skeleton's proportions, so they're never converted.
+    if operator.fit_to_armature and not additive:
+        source_offsets = _source_offsets(operator, context, filepath, jba, ob, scale, anim_name)
+    else:
+        source_offsets = {}
+
     animation_data = ob.animation_data
     if animation_data.use_tweak_mode:
         animation_data.use_tweak_mode = False
@@ -904,75 +1193,79 @@ def build(operator, context, filepath, jba):
     animation_data.action_blend_type = 'REPLACE'
     animation_data.action_influence = 1.0
 
-    for anim_frame in range(jba.num_frames):
-        for anim_bone in jba.bones:
-            bone_name = getattr(anim_bone, "name", "")
+    # One bone at a time: its rest and correction are worked out once, and its
+    # keys written in bulk (see _key_channels()). The pose bone is left showing
+    # the last frame, as keyframe_insert() would have left it.
+    key_types = _new_key_types(context)
+    frames = [1 + anim_frame * frames_per_sample for anim_frame in range(jba.num_frames)]
+    for anim_bone in jba.bones:
+        bone_name = getattr(anim_bone, "name", "")
+        if bone_name not in ob.pose.bones:
+            continue
+        pose_bone = ob.pose.bones[bone_name]
 
-            if bone_name in ob.pose.bones:
-                pose_bone = ob.pose.bones[bone_name]
+        # Rest in the file's own bone axes (see top of file)
+        correction = _rest_correction(pose_bone.bone)
+        correction_inv = correction.inverted()
+        mat_rest = _file_rest_local(pose_bone)
+        if not additive and bone_name in KNOWN_180_FLIP_BONES:
+            mat_rest = mat_rest @ BONE_REST_FLIP_CORRECTION
+        mat_rest_inv = mat_rest.inverted()
+        rest_translation = mat_rest.to_translation()
+        rest_rotation = mat_rest.to_3x3()
+        key_rotation = not (operator.delete_180 and bone_name in KNOWN_180_FLIP_BONES)
+        # ignore_facial_bones: see below
+        ignore_translation = (not additive and operator.ignore_facial_bones
+                              and bone_name.lower().startswith("fc_"))
+        source_offset = source_offsets.get(bone_name)
 
-                # Rest in the file's own bone axes (see top of file)
-                correction = _rest_correction(pose_bone.bone)
-                mat_rest = _file_rest_local(pose_bone)
-                mat_rot = anim_bone.rotations[anim_frame].to_matrix().to_4x4()
-                frame = 1 + anim_frame * frames_per_sample
+        locations = []
+        rotations = []
+        mat_basis = None
+        for anim_frame in range(jba.num_frames):
+            mat_rot = anim_bone.rotations[anim_frame].to_matrix().to_4x4()
 
-                if additive:
-                    # Offsets on top of the rest pose (see top of file): no
-                    # Bip01 flip correction (the rest is used as it is), and
-                    # the translation is the offset itself, not a delta from
-                    # translation_base.
-                    mat_add = (morpheme_space_inv @ Matrix.Translation(anim_bone.translations[anim_frame])
-                               @ mat_rot @ morpheme_space)
-                    mat_final = (Matrix.Translation(mat_rest.to_translation() + mat_add.to_translation())
-                                 @ (mat_rest.to_3x3() @ mat_add.to_3x3()).to_4x4())
-                    pose_bone.matrix_basis = correction.inverted() @ (mat_rest.inverted() @ mat_final) @ correction
-                    pose_bone.keyframe_insert(data_path="location", frame=frame)
-                    if not (operator.delete_180 and bone_name in KNOWN_180_FLIP_BONES):
-                        pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
-                    continue
-
-                if bone_name in KNOWN_180_FLIP_BONES:
-                    mat_rest = mat_rest @ BONE_REST_FLIP_CORRECTION
-
-                # anim_bone.translations[frame] is an ABSOLUTE bone-to-parent
-                # offset as authored on whatever rig this specific clip was
-                # captured against - not necessarily this armature's own
-                # offset for the same bone (confirmed on a real
-                # shared-across-body-types clip: several static bones were
-                # off by 15-35% against the target skeleton's actual
-                # proportions, visibly pulling joints out of place). Using
-                # it directly is only safe when it happens to match.
+            if additive:
+                # Offsets on top of the rest pose (see top of file): no
+                # Bip01 flip correction (the rest is used as it is), and
+                # the translation is the offset itself, not a delta from
+                # translation_base.
+                mat_add = (morpheme_space_inv @ Matrix.Translation(anim_bone.translations[anim_frame])
+                           @ mat_rot @ morpheme_space)
+                mat_final = (Matrix.Translation(rest_translation + mat_add.to_translation())
+                             @ (rest_rotation @ mat_add.to_3x3()).to_4x4())
+                mat_basis = correction_inv @ (mat_rest_inv @ mat_final) @ correction
+            else:
+                # anim_bone.translations[frame] is the bone's own offset from
+                # its parent on the skeleton the clip was made for. Used as
+                # it is when that's this armature; otherwise converted to
+                # this armature's proportions as
+                #     this armature's rest offset + (stored - source's rest offset)
+                # (see top of file: SOURCE SKELETON).
                 #
-                # What's reliable is the DELTA from the file's own
-                # translation_base, since that's this bone's actual motion
-                # within the clip regardless of which rig authored it. So
-                # every bone's translation is built the same way: take this
-                # armature's own rest-pose offset and add only that delta on
-                # top, converted through morpheme_space like everything
-                # else. A bone with no real motion (delta == 0, whether
-                # because it never had a per-frame track at all or because
-                # it has one that happens to be constant) lands exactly on
-                # this armature's own rest translation; a bone that really
-                # animates (e.g. Root) keeps that motion, applied relative
-                # to this armature's own bind pose instead of the file's.
-                #
-                # This also covers what ignore_facial_bones needs (ignore
-                # this bone's translation animation entirely) as the delta
-                # being forced to zero, rather than needing a separate
-                # translation composition for that case.
-                if operator.ignore_facial_bones and bone_name.lower().startswith("fc_"):
-                    delta = Vector((0.0, 0.0, 0.0))
+                # ignore_facial_bones: the face bones keep this armature's
+                # own rest offset instead.
+                if ignore_translation:
+                    mat_bone = morpheme_space_inv @ mat_rot @ morpheme_space
+                    mat_bone.translation = rest_translation
                 else:
-                    delta = anim_bone.translations[anim_frame] - anim_bone.translation_base
+                    mat_bone = (morpheme_space_inv @ Matrix.Translation(anim_bone.translations[anim_frame])
+                                @ mat_rot @ morpheme_space)
+                    if source_offset is not None:
+                        mat_bone.translation = mat_bone.translation + source_offset
+                mat_basis = correction_inv @ (mat_rest_inv @ mat_bone) @ correction
 
-                mat_bone = morpheme_space_inv @ Matrix.Translation(delta) @ mat_rot @ morpheme_space
-                mat_bone.translation = mat_rest.to_translation() + mat_bone.translation
+            # What setting pose_bone.matrix_basis would put in its location and rotation_quaternion
+            location, rotation, _ = mat_basis.decompose()
+            locations.append(location)
+            rotations.append(rotation)
 
-                pose_bone.matrix_basis = correction.inverted() @ (mat_rest.inverted() @ mat_bone) @ correction
-                pose_bone.keyframe_insert(data_path="location", frame=frame)
-                if not (operator.delete_180 and bone_name in KNOWN_180_FLIP_BONES):
-                    pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+        pose_bone.matrix_basis = mat_basis
+        group_name = pose_bone.name
+        _key_channels(action, ob, key_types, pose_bone.path_from_id("location"), group_name, frames, locations)
+        if key_rotation:
+            _key_channels(action, ob, key_types, pose_bone.path_from_id("rotation_quaternion"), group_name,
+                          frames, rotations)
 
     # delete_180 is a distinct, deliberate feature from the rest-pose
     # correction above (which is always applied and just makes an
@@ -989,7 +1282,7 @@ def build(operator, context, filepath, jba):
             if bone_name in ob.pose.bones:
                 ob.pose.bones[bone_name].rotation_quaternion = (1, 0, 0, 0)
 
-    _key_world_motion(operator, ob, jba, morpheme_space, morpheme_space_inv, frames_per_sample)
+    _key_world_motion(operator, ob, jba, morpheme_space, morpheme_space_inv, frames_per_sample, key_types)
 
     animation_data.action_blend_type, animation_data.action_influence = saved_blend
 
