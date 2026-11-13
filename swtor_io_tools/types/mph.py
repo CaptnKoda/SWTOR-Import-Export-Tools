@@ -12,6 +12,8 @@ it can be run and tested on its own.
 • find_bone_names(): the bone names of a .jba animation, looked up in a rig's
   folder. Reading every file of a folder takes a while, so results are cached
   per folder for the session.
+• find_bone_name_candidates(): every bone order the folder gives an
+  animation, for when its sources disagree.
 • read_anim_bone_names(): the same information from a single .mph file.
 • read_string_table_64(): the 64-bit string table layout, which .jba files
   with their own bone names use as well.
@@ -172,13 +174,9 @@ def _read_anim_bone_names_safely(filepath):
         return {}
 
 
-def find_bone_names(rig_folder, anim_name, num_bones):
-    # type: (str, str, int) -> Tuple[Optional[List[str]], Optional[str], int]
-    """
-    Returns (bone names, where they came from, 1), or (None, None, number of
-    different bone orders the folder uses for num_bones bones) if the
-    animation's bone names can't be determined.
-    """
+def _folder_cache(rig_folder, with_networks):
+    # type: (str, bool) -> dict
+    """The folder's anim_library.mph (always) and other networks (if with_networks), read once per session."""
     cache = _rig_folders_cache.get(rig_folder)
     if cache is None:
         library_path = os.path.join(rig_folder, MPH_ANIM_LIBRARY_FILE)
@@ -189,16 +187,7 @@ def find_bone_names(rig_folder, anim_name, num_bones):
         }
         _rig_folders_cache[rig_folder] = cache
 
-    # The animation library network lists nearly every animation in its
-    # folder, and has always agreed with the names tables some .jba files have.
-    bone_names = cache["library"].get(anim_name)
-    if bone_names and len(bone_names) == num_bones:
-        return bone_names, BONES_FROM_LIBRARY, 1
-
-    # Otherwise look through every other network. Networks in the same folder
-    # can have been built with rigs listing the same bones in different
-    # orders, so only take an answer that all of them agree on.
-    if cache["networks"] is None:
+    if with_networks and cache["networks"] is None:
         networks = {}
         by_count = {}
         for bone_names in cache["library"].values():
@@ -214,6 +203,28 @@ def find_bone_names(rig_folder, anim_name, num_bones):
                     by_count[len(bone_names)].append(bone_names)
         cache["networks"] = networks
         cache["by_count"] = by_count
+    return cache
+
+
+def find_bone_names(rig_folder, anim_name, num_bones):
+    # type: (str, str, int) -> Tuple[Optional[List[str]], Optional[str], int]
+    """
+    Returns (bone names, where they came from, 1), or (None, None, number of
+    different bone orders the folder uses for num_bones bones) if the
+    animation's bone names can't be determined.
+    """
+    cache = _folder_cache(rig_folder, with_networks=False)
+
+    # The animation library network lists nearly every animation in its
+    # folder, and has always agreed with the names tables some .jba files have.
+    bone_names = cache["library"].get(anim_name)
+    if bone_names and len(bone_names) == num_bones:
+        return bone_names, BONES_FROM_LIBRARY, 1
+
+    # Otherwise look through every other network. Networks in the same folder
+    # can have been built with rigs listing the same bones in different
+    # orders, so only take an answer that all of them agree on.
+    cache = _folder_cache(rig_folder, with_networks=True)
 
     candidates = [names for names in cache["networks"].get(anim_name, []) if len(names) == num_bones]
     if len(candidates) == 1:
@@ -226,3 +237,32 @@ def find_bone_names(rig_folder, anim_name, num_bones):
         return candidates[0], BONES_INFERRED, 1
 
     return None, None, len(candidates)
+
+
+def find_bone_name_candidates(rig_folder, anim_name, num_bones):
+    # type: (str, str, int) -> List[Tuple[List[str], str]]
+    """
+    Every bone order the folder gives the animation, as [(bone names, where
+    they came from)], most trusted first: anim_library.mph's, then any other
+    order the other networks list the animation with; or, when no network
+    lists it, every order the folder uses for num_bones bones
+    (BONES_INFERRED). Empty if there's none.
+
+    The sources don't always agree: in the humanoid rigs, anim_library.mph
+    and the other networks list some 400 animations (of about 55,000) with
+    different orders. The library is right for nearly all of them, but not
+    all (e.g. bfanew's cb_pistol_fire_special_1), so with several candidates
+    the caller should check them against the animation's data (see
+    ops/import_jba.py: _resolve_bone_names()).
+    """
+    cache = _folder_cache(rig_folder, with_networks=True)
+    candidates = []
+    library_names = cache["library"].get(anim_name)
+    if library_names and len(library_names) == num_bones:
+        candidates.append((library_names, BONES_FROM_LIBRARY))
+    for names in cache["networks"].get(anim_name, []):
+        if len(names) == num_bones and all(names != c for c, _ in candidates):
+            candidates.append((names, BONES_FROM_DATA))
+    if not candidates:
+        candidates = [(names, BONES_INFERRED) for names in cache["by_count"].get(num_bones, [])]
+    return candidates

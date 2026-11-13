@@ -92,6 +92,13 @@ duplicate bone name) and 'gr2_mirror_axis'.
 Per object: 'gr2_type_flag', 'gr2_attachment_bones', 'gr2_bnry_summary' (if
 any), 'gr2_bone_orientation', 'import_scale' and 'import_axis_conversion'
 (the .jba importer reads 'import_scale').
+From the skeleton's character specification (art/dynamic/spec/*.dyc/.dat,
+see types/spec.py and _apply_character_spec()), when one is found:
+'swtor_spec', 'swtor_anim_folder' and 'swtor_anim_metadata' (the rig's
+animation folder and action list, resources-relative) and
+'swtor_resources_root'. The .jba importer uses them to find the rig's
+animation data. The spec's bone masks become bone collections
+("Mask: upperbody").
 
 
 Data deliberately NOT kept
@@ -387,6 +394,56 @@ def build_armature(gr2, filepath, scale_object=False, scale_factor=1.0, apply_ax
         return None
 
 
+MASK_COLLECTION_PREFIX = "Mask: "
+
+
+def _apply_character_spec(ob, armature, filepath, operator):
+    # type: (bpy.types.Object, bpy.types.Armature, str, Optional[bpy.types.Operator]) -> None
+    """
+    Looks up the skeleton's character specification (types/spec.py: the
+    .dyc/.dat files next to it in art/dynamic/spec, or in the Resources
+    Directory's) and stores what the .jba importer needs on the armature:
+    'swtor_spec', 'swtor_anim_folder' and 'swtor_anim_metadata' (both
+    resources-relative, "/"-separated) and 'swtor_resources_root' (if known).
+    The spec's bone masks become bone collections ("Mask: upperbody"). Nothing
+    happens if there's no spec: the .jba importer then falls back to finding
+    the rig's folder by name.
+    """
+    from ..types.spec import find_character_spec, spec_folders_for
+
+    try:
+        prefs = bpy.context.preferences.addons["swtor_io_tools"].preferences
+        resources_dirs = [prefs.swtor_resources_dir]
+    except (KeyError, AttributeError):
+        resources_dirs = []
+    try:
+        spec = find_character_spec(os.path.basename(filepath), spec_folders_for(filepath, resources_dirs))
+    except OSError:
+        spec = None
+    if spec is None:
+        return
+
+    ob["swtor_spec"] = spec.name
+    if spec.anim_folder:
+        ob["swtor_anim_folder"] = spec.anim_folder
+    if spec.anim_metadata:
+        ob["swtor_anim_metadata"] = spec.anim_metadata
+    if spec.resources_root:
+        ob["swtor_resources_root"] = spec.resources_root
+
+    for mask_name, weights in spec.masks.items():
+        bones = [armature.bones[name] for name, weight in weights.items() if weight > 0 and name in armature.bones]
+        if not bones:
+            continue
+        collection = armature.collections.new(MASK_COLLECTION_PREFIX + mask_name)
+        for bone in bones:
+            collection.assign(bone)
+
+    masks = ", ".join(spec.masks) or "none"
+    _report(operator, 'INFO', f"'{ob.name}': character specification '{spec.name}' (animations in "
+                              f"{spec.anim_folder or '?'}, bone masks: {masks}).")
+
+
 def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, operator, created):
     # The bones, in file order, as the file stores them
     if sorted(gr2.bone_buffer) != list(range(len(gr2.bone_buffer))):
@@ -503,6 +560,8 @@ def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, ope
         ob.matrix_local = Matrix.Rotation(PI * 0.5, 4, 'X')
     ob["import_scale"] = scale
     ob["import_axis_conversion"] = bool(apply_axis_conversion)
+
+    _apply_character_spec(ob, armature, filepath, operator)
 
     mirror_count = sum(1 for axis in mirror_axes if axis)
     summary = _accuracy_summary(bones, ob, blender_names, rotation, scale, mirror_count)

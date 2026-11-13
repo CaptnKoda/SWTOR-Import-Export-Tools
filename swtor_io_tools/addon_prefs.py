@@ -128,6 +128,18 @@ class Prefs(bpy.types.AddonPreferences):
         default=True,
     )
 
+    jba_cyclic_loops: bpy.props.BoolProperty(
+        name="Loop Looping Animations",
+        description="Animations the game plays as loops (its action list's 'ambient' ones, e.g. idles)\nget a cyclic action: Cycles modifiers on their F-curves and a cyclic\nframe range, so they repeat when played past their end.\n\nOff: looping animations play once, like the others",
+        default=True,
+    )
+
+    jba_masked_bones_only: bpy.props.BoolProperty(
+        name="Masked Bones Only",
+        description="For animations the game plays on part of the body (its action list gives them a\nbone mask, e.g. 'upperbody'), keys only the mask's bones, so the action can be\nlayered over a locomotion action in the NLA, and named as such\n('em_wave_[masked_upperbody]'). This leaves out the clip's other bones.\n\nOff: every bone in the clip is keyed",
+        default=False,
+    )
+
     # UI ----------------------------------------
     
     def draw(self, context):        
@@ -173,6 +185,8 @@ class Prefs(bpy.types.AddonPreferences):
         boxcol.prop(self,'jba_import_as_nla')
         boxcol.prop(self,'jba_repair_broken_frames')
         boxcol.prop(self,'jba_fit_to_armature')
+        boxcol.prop(self,'jba_cyclic_loops')
+        boxcol.prop(self,'jba_masked_bones_only')
         boxcol.label()
         boxcol.label(text="The Animation and Character Importers")
         boxcol.label(text="use all the applicable .gr2 Object settings.")
