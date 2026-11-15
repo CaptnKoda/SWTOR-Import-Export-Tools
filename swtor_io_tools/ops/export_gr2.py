@@ -1046,16 +1046,8 @@ def save(operator, context, path, ob, global_matrix=None, version=5):
 
         # Calculate normals and tangents.
         if bmesh.polygons:
-            # Blender 4.0 removed Mesh.calc_normals_split(): custom split normals
-            # are now derived automatically, and calc_tangents() no longer
-            # requires a prior explicit split-normals pass. Use Blender version
-            # (and hasattr, as fallback) to keep 3.6 support intact.
-            # NOTE: the old 32-bit exporter was missing this guard entirely and
-            # called calc_normals_split() unconditionally, which crashes on
-            # Blender 4.0+ (the method was removed). Unifying the two exporters
-            # fixes that for free.
-            if bpy.app.version < (4, 0, 0) and hasattr(bmesh, "calc_normals_split"):
-                bmesh.calc_normals_split()
+            # Custom split normals are derived automatically, so calc_tangents()
+            # needs no prior explicit split-normals pass.
             bmesh.calc_tangents()
 
         progress.step(f"Parsing Blender Object: \'{ob.name}\' ...", 1)

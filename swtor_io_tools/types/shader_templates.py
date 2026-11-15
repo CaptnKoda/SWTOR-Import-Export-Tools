@@ -23,6 +23,7 @@ append -> remap -> orphan-purge mechanics this requires).
 """
 
 import re
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict
 
@@ -180,7 +181,74 @@ def _strip_dot_suffix(name):
 # Append + dedup
 # ---------------------------------------------------------------------------
 
+# While a template_copies() block is open: shader_type -> an untouched copy of that
+# type's template material, kept so later materials of the type can be copied from it
+# instead of appended from the .blend again. None outside such a block.
+_template_copy_session = None
+
+
+@contextmanager
+def template_copies():
+    """
+    Use around a bulk build (the Area Assembler's materials pass): every material of
+    a shader type after the first is a COPY of that type's freshly appended template
+    instead of another bpy.data.libraries.load() -- about 150 ms each, plus a global
+    orphans_purge() whenever a group had to be deduped -- which on a big import was
+    the largest remaining cost. The copies share the same canonical shader group the
+    dedup produces, so what comes out matches appending again. The kept originals
+    are removed when the block ends (they hold nothing a purge would need to clean
+    up: the material that was appended first holds the same groups and images).
+    Re-entrant: an inner block just joins the outer one.
+    """
+    global _template_copy_session
+    if _template_copy_session is not None:
+        yield
+        return
+    _template_copy_session = {}
+    try:
+        yield
+    finally:
+        pristines = list(_template_copy_session.values())
+        _template_copy_session = None
+        for material in pristines:
+            try:
+                bpy.data.materials.remove(material)
+            except (ReferenceError, RuntimeError):
+                pass
+
+
 def _append_template_material(shader_type, scratch_name):
+    # type: (str, str) -> bpy.types.Material
+    """
+    Returns a fresh, unconfigured template material for shader_type under
+    scratch_name: appended from the template .blend, or -- inside a
+    template_copies() block, from the second material of a type on -- copied from
+    the first one's untouched original. See _append_template_material_from_blend()
+    for everything about what the result looks like.
+    """
+    session = _template_copy_session
+    if session is not None:
+        pristine = session.get(shader_type)
+        if pristine is not None:
+            try:
+                new_mat = pristine.copy()
+            except ReferenceError:      # something purged our copy -- append again below
+                session.pop(shader_type, None)
+            else:
+                new_mat.use_fake_user = False
+                new_mat.name = scratch_name
+                return new_mat
+    new_mat = _append_template_material_from_blend(shader_type, scratch_name)
+    if session is not None:
+        # Keep an untouched copy NOW, before the caller starts configuring new_mat.
+        kept = new_mat.copy()
+        kept.use_fake_user = True
+        kept.name = "__shader_template_copy_source__ " + shader_type
+        session[shader_type] = kept
+    return new_mat
+
+
+def _append_template_material_from_blend(shader_type, scratch_name):
     # type: (str, str) -> bpy.types.Material
     """
     Appends shader_type's template material from HeroEngine_Shaders.blend

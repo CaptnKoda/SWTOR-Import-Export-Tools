@@ -26,9 +26,10 @@ from math import pi as PI
 from pathlib import Path
 from typing import Optional, Set
 import time
+from itertools import chain
 
 import bpy
-from bpy import app
+import numpy as np
 from bpy.props import BoolProperty, CollectionProperty, FloatProperty, StringProperty
 from bpy.types import Context, Operator, OperatorFileListElement
 # from bpy_extras.io_utils import ImportHelper
@@ -42,9 +43,6 @@ from ..utils.number import decodeHalfFloat
 from ..utils.string import readString
 
 from ..types.shared import job_results  # add-on-wide global-like dict
-
-
-BLENDER_VERSION = app.version
 
 
 class ImportGR2(Operator):
@@ -77,10 +75,7 @@ class ImportGR2(Operator):
     
     filepath: StringProperty(subtype='FILE_PATH')
     
-    if BLENDER_VERSION < (2, 82, 0):
-        directory = StringProperty(subtype='DIR_PATH')
-    else:
-        directory: StringProperty(subtype='DIR_PATH')
+    directory: StringProperty(subtype='DIR_PATH')
 
     filename_ext = ".gr2"
 
@@ -655,6 +650,131 @@ def main_mesh_key(mesh_buffer, import_collision):
     return included_keys[position] if position is not None else None
 
 
+def _fill_corner_data(blend_mesh, mesh, material_indices, temp_custom_normals):
+    # type: (bpy.types.Mesh, object, list, object) -> None
+    """
+    Writes every per-corner value the mesh needs -- the temporary custom normals,
+    each UV layer (v flipped, as the game stores it), and the per-polygon material
+    indices -- with a few bulk foreach_set() calls.
+
+    This used to be a Python loop over every polygon corner doing a handful of
+    individual attribute writes per corner, which dominated import time for big
+    meshes. The values are identical: the per-vertex data is read ONCE per distinct
+    vertex, expanded to corners with numpy, and written in one call per array.
+
+    Anything unexpected in the file (a polygon whose size doesn't match its index
+    entry, a missing vertex, ...) falls back to the original per-corner loop, which
+    handles -- or fails on -- exactly what it always did.
+    """
+    try:
+        corner_normals, corner_uvs, polygon_material_index = _corner_arrays(blend_mesh, mesh, material_indices)
+    except (KeyError, IndexError, ValueError, TypeError, AttributeError):
+        _fill_corner_data_per_corner(blend_mesh, mesh, material_indices, temp_custom_normals)
+        return
+
+    temp_custom_normals.foreach_set("vector", corner_normals.ravel())
+    for layer_index, corner_uv in enumerate(corner_uvs):
+        blend_mesh.uv_layers[layer_index].data.foreach_set("uv", corner_uv.ravel())
+    blend_mesh.polygons.foreach_set("material_index", polygon_material_index)
+
+
+# Results of Vector.normalized() for every distinct (x, y, z) seen so far. The game stores
+# normals as bytes, so there are few distinct vectors compared with the number of vertices.
+_NORMALIZED_CACHE = {}
+
+
+def _normalized_like_mathutils(normals):
+    """
+    normals: float32 array (n, 3) of un-normalised vertex normals.
+    Returns a float32 array (n, 3) holding the same values as
+    Vector(normal).normalized() gives for each row (zero stays zero).
+
+    Every distinct row goes through mathutils exactly once (and is remembered for the
+    rest of the session), so this matches the original per-corner code bit for bit
+    while only making a Python call per distinct normal, not per corner.
+    """
+    distinct, inverse = np.unique(normals, axis=0, return_inverse=True)
+    inverse = inverse.reshape(-1)
+    result = np.empty_like(distinct)
+    cache = _NORMALIZED_CACHE
+    for i, row in enumerate(distinct.tolist()):
+        key = tuple(row)
+        value = cache.get(key)
+        if value is None:
+            value = tuple(Vector(row).normalized())
+            cache[key] = value
+        result[i] = value
+    return result[inverse]
+
+
+def _corner_arrays(blend_mesh, mesh, material_indices):
+    """Returns (corner normals (n,3), [corner uvs (n,2) per UV layer], polygon material indices)."""
+    num_polygons = len(blend_mesh.polygons)
+    num_corners = len(blend_mesh.loops)
+    if num_corners == 0 or len(material_indices) != num_polygons:
+        raise ValueError("unusual mesh")
+
+    # Corner order is polygon order (from_pydata), but check rather than assume.
+    loop_start = np.empty(num_polygons, dtype=np.int32)
+    loop_total = np.empty(num_polygons, dtype=np.int32)
+    blend_mesh.polygons.foreach_get("loop_start", loop_start)
+    blend_mesh.polygons.foreach_get("loop_total", loop_total)
+    faces = [mesh.indices_buffer[j] for j in range(num_polygons)]
+    if [len(face) for face in faces] != loop_total.tolist():
+        raise ValueError("polygon size mismatch")
+    if not np.array_equal(loop_start, np.cumsum(loop_total) - loop_total):
+        raise ValueError("unexpected corner order")
+
+    keys = np.fromiter(chain.from_iterable(faces), dtype=np.int64, count=num_corners)
+    unique_keys, corner_to_vertex = np.unique(keys, return_inverse=True)
+    corner_to_vertex = corner_to_vertex.reshape(-1)
+    vertices = [mesh.vertex_buffer[int(key)] for key in unique_keys]
+
+    # Normalised by mathutils.Vector.normalized() itself (once per distinct normal, see
+    # _normalized_like_mathutils()), so the result is bit-identical to the original
+    # per-corner code. A numpy reimplementation of the normalisation differs from
+    # mathutils by up to 2 ulp on ~13% of corners, which Blender's compressed custom
+    # normals can amplify to ~5e-4 on some meshes.
+    normals = np.array([(n.x, n.y, n.z) for n in (v.normals for v in vertices)], dtype=np.float32)
+    corner_normals = _normalized_like_mathutils(normals)[corner_to_vertex]
+
+    uv_attribute_names = ["uv_layer0"]
+    if mesh.bit_flag2 & 64:   # 0x40
+        uv_attribute_names.append("uv_layer1")
+    if mesh.bit_flag2 & 128:  # 0x80
+        uv_attribute_names.append("uv_layer2")
+    corner_uvs = []
+    for name in uv_attribute_names:
+        uv = np.array([(u.x, u.y) for u in (getattr(v, name) for v in vertices)], dtype=np.float64)
+        uv[:, 1] = 1.0 - uv[:, 1]
+        corner_uvs.append(uv.astype(np.float32)[corner_to_vertex])
+
+    return corner_normals, corner_uvs, np.asarray(material_indices, dtype=np.int32)
+
+
+def _fill_corner_data_per_corner(blend_mesh, mesh, material_indices, temp_custom_normals):
+    """The original per-corner version of _fill_corner_data(): the fallback for odd meshes."""
+    for j, polygon in enumerate(blend_mesh.polygons):
+        loop_indices = polygon.loop_indices
+
+        for k, loop_index in enumerate(loop_indices):
+            v = mesh.vertex_buffer[mesh.indices_buffer[j][k]]
+
+            # We normalize the vectors because storing them in custom attributes
+            # doesn't normalize them for free the way mesh.loops[loop_index].normal used to.
+            temp_custom_normals[loop_index].vector = v.normals.xyz.normalized()
+
+            # UV stuff
+            blend_mesh.uv_layers[0].data[loop_index].uv = [v.uv_layer0.x, 1 - v.uv_layer0.y]
+            if mesh.bit_flag2 & 64:  # 0x40
+                blend_mesh.uv_layers[1].data[loop_index].uv = [v.uv_layer1.x, 1 - v.uv_layer1.y]
+            if mesh.bit_flag2 & 128:  # 0x80
+                blend_mesh.uv_layers[2].data[loop_index].uv = [v.uv_layer2.x, 1 - v.uv_layer2.y]
+
+        # Material stuff
+        polygon.material_index = material_indices[j]
+
+
 def build(gr2,
           filepath="",
           import_collision        = None,
@@ -714,122 +834,47 @@ def build(gr2,
                     material_indices.append(j)
 
 
-        if BLENDER_VERSION < (4, 1, 0):
-            
-            if mesh.bit_flag2 & 2:   # 0x02
-                # NOTE: We store 'temp' normals in loops, since validate() may alter final mesh,
-                #       we can only set custom loop normals *after* calling it.
-                blend_mesh.create_normals_split()  # (DEPRECATED IN BLENDER 4.1)
-                    
-                # UV stuff
-                blend_mesh.uv_layers.new(do_init=False)
-                if mesh.bit_flag2 & 64:  # 0x40
-                    blend_mesh.uv_layers.new(do_init=False)
-                if mesh.bit_flag2 & 128:  # 0x80
-                    blend_mesh.uv_layers.new(do_init=False)
-
-
-                for j, polygon in enumerate(blend_mesh.polygons):
-                    loop_indices = polygon.loop_indices
-
-                    for k, loop_index in enumerate(loop_indices):
-                        v = mesh.vertex_buffer[mesh.indices_buffer[j][k]]
-                        
-                        # We store the temp normals in each loop's normal attribute directly.
-                        # This, also, normalizes the normal vectors "for free".
-                        # (DEPRECATED IN BLENDER 4.1 where blend_mesh.loops[loop_index].normal is read-only)
-                        blend_mesh.loops[loop_index].normal = [v.normals.x, v.normals.y, v.normals.z]
-                        
-                        # UV stuff
-                        blend_mesh.uv_layers[0].data[loop_index].uv = [v.uv_layer0.x, 1 - v.uv_layer0.y]
-                        if mesh.bit_flag2 & 64:  # 0x40
-                            blend_mesh.uv_layers[1].data[loop_index].uv = [v.uv_layer1.x, 1 - v.uv_layer1.y]
-                        if mesh.bit_flag2 & 128:  # 0x80
-                            blend_mesh.uv_layers[2].data[loop_index].uv = [v.uv_layer2.x, 1 - v.uv_layer2.y]
-
-                    # Material stuff
-                    polygon.material_index = material_indices[j]
-
-                blend_mesh.validate(clean_customdata=False, verbose=True)
-
-                print("-" * 20)
-
-                # Retrieve the "validated" temp normals
-                custom_loop_normals = [0.0] * (len(blend_mesh.loops) * 3)                
-                blend_mesh.loops.foreach_get("normal", custom_loop_normals)
-                
-                # Apply them as split normals to the mesh
-                blend_mesh.polygons.foreach_set("use_smooth", [True] * len(blend_mesh.polygons))                
-                blend_mesh.normals_split_custom_set(
-                    tuple(zip(*(iter(custom_loop_normals),) * 3))
-                    )
-                blend_mesh.use_auto_smooth = True  # (DEPRECATED IN BLENDER 4.1)
-
-        else:
-            
-            if mesh.bit_flag2 & 2:   # 0x02
-                # NOTE: We store 'temp' normals in loops, since validate() may alter final mesh,
-                #       we can only set custom loop normals *after* calling it.
-                # We use a custom attribute to store them because we can't use
-                # the "normal" attribute: blend_mesh.loops[loop_index].normal is
-                # read-only in 4.1 and higher.
-                                                    
-                # UV stuff
-                blend_mesh.uv_layers.new(do_init=False)
-                if mesh.bit_flag2 & 64:  # 0x40
-                    blend_mesh.uv_layers.new(do_init=False)
-                if mesh.bit_flag2 & 128:  # 0x80
-                    blend_mesh.uv_layers.new(do_init=False)
-
-                # For some reason, the creation of extra UV map layers for
-                # multiUvExtraction objects blitzes the temp normals custom attribute,
-                # so, we are creating it AFTER the creation of UV layers.
-                temp_custom_normals = blend_mesh.attributes.new(
-                    name="temp_custom_normals",
-                    type='FLOAT_VECTOR',
-                    domain='CORNER'
-                    ).data
-
-
-                for j, polygon in enumerate(blend_mesh.polygons):
-                    loop_indices = polygon.loop_indices
-
-                    for k, loop_index in enumerate(loop_indices):
-                        v = mesh.vertex_buffer[mesh.indices_buffer[j][k]]
-                        
-                        # We normalize the vectors because storing them in custom attributes
-                        # doesn't normalize them for free the way mesh.loops[loop_index].normal used to.
-                        # As we are using for the normals data the mathutils' Vector type,
-                        # we use its normalized() method (instead of normalize() which might be slower?).
-                        # blend_mesh.loops[loop_index].normal = [v.normals.x, v.normals.y, v.normals.z]
-
-                        # temp_custom_normals[loop_index].vector = v.normals.xyz.normalized()
-                        temp_custom_normals[loop_index].vector = v.normals.xyz.normalized()
+        
+        if mesh.bit_flag2 & 2:   # 0x02
+            # NOTE: We store 'temp' normals in loops, since validate() may alter final mesh,
+            #       we can only set custom loop normals *after* calling it.
+            # We use a custom attribute to store them because we can't use
+            # the "normal" attribute: blend_mesh.loops[loop_index].normal is
+            # read-only.
                                                 
-                        # UV stuff
-                        blend_mesh.uv_layers[0].data[loop_index].uv = [v.uv_layer0.x, 1 - v.uv_layer0.y]
-                        if mesh.bit_flag2 & 64:  # 0x40
-                            blend_mesh.uv_layers[1].data[loop_index].uv = [v.uv_layer1.x, 1 - v.uv_layer1.y]
-                        if mesh.bit_flag2 & 128:  # 0x80
-                            blend_mesh.uv_layers[2].data[loop_index].uv = [v.uv_layer2.x, 1 - v.uv_layer2.y]
+            # UV stuff
+            blend_mesh.uv_layers.new(do_init=False)
+            if mesh.bit_flag2 & 64:  # 0x40
+                blend_mesh.uv_layers.new(do_init=False)
+            if mesh.bit_flag2 & 128:  # 0x80
+                blend_mesh.uv_layers.new(do_init=False)
 
-                    # Material stuff
-                    polygon.material_index = material_indices[j]
+            # For some reason, the creation of extra UV map layers for
+            # multiUvExtraction objects blitzes the temp normals custom attribute,
+            # so, we are creating it AFTER the creation of UV layers.
+            temp_custom_normals = blend_mesh.attributes.new(
+                name="temp_custom_normals",
+                type='FLOAT_VECTOR',
+                domain='CORNER'
+                ).data
 
 
-                blend_mesh.validate(clean_customdata=False)
+            # Normals, every UV layer and the material indices, written in a handful of
+            # bulk calls instead of one Python <-> Blender call per corner (see
+            # _fill_corner_data()).
+            _fill_corner_data(blend_mesh, mesh, material_indices, temp_custom_normals)
 
 
-                # Retrieve the "validated" temp normals
-                custom_loop_normals = [0.0] * (len(blend_mesh.loops) * 3)
-                temp_custom_normals.foreach_get("vector", custom_loop_normals)
-                
-                # Apply them as split normals to the mesh
-                blend_mesh.polygons.foreach_set("use_smooth", [True] * len(blend_mesh.polygons))
-                blend_mesh.normals_split_custom_set(
-                    tuple(zip(*(iter(custom_loop_normals),) * 3))
-                    )
+            blend_mesh.validate(clean_customdata=False)
 
+
+            # Retrieve the "validated" temp normals
+            custom_loop_normals = np.empty(len(blend_mesh.loops) * 3, dtype=np.float32)
+            temp_custom_normals.foreach_get("vector", custom_loop_normals)
+            
+            # Apply them as split normals to the mesh
+            blend_mesh.polygons.foreach_set("use_smooth", np.ones(len(blend_mesh.polygons), dtype=np.bool_))
+            blend_mesh.normals_split_custom_set(custom_loop_normals.reshape(-1, 3).tolist())
 
 
         # Create Blender Object
@@ -885,10 +930,16 @@ def build(gr2,
         # Adjust the orientation of the model
         ob.matrix_local = Matrix.Rotation(PI * 0.5, 4, 'X')
 
-        # Deselect all, then select imported model
-        bpy.ops.object.select_all(action='DESELECT')
-        ob.select_set(True)
-        bpy.context.view_layer.objects.active = ob
+        # Deselect all, then select imported model. Only needed for the
+        # transform_apply below, which works on the selection -- so a caller that
+        # enforces neutral settings and applies nothing (Area Assembler) skips it.
+        # bpy.ops.object.select_all() costs time proportional to every object in the
+        # scene, and runs once per imported object: on a big batch that added up to
+        # minutes. The standalone importer keeps selecting what it imports.
+        if scale_object or apply_axis_conversion or not getattr(operator, "enforce_neutral_settings", False):
+            bpy.ops.object.select_all(action='DESELECT')
+            ob.select_set(True)
+            bpy.context.view_layer.objects.active = ob
         
         # Apply transformation options and record them
         # in custom object properties 
@@ -941,7 +992,9 @@ def load(operator, context, filepath = ""):
 
         start_time = time.time()
         
-        if bpy.ops.object.mode_set.poll():
+        # Already in Object Mode (always, in a batch) -> nothing to switch, and the
+        # operator call itself is not free in a large scene.
+        if bpy.context.mode != 'OBJECT' and bpy.ops.object.mode_set.poll():
             bpy.ops.object.mode_set(mode='OBJECT', toggle=False)
 
         if operator.enforce_neutral_settings:
