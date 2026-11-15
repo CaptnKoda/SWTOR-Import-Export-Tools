@@ -1553,7 +1553,30 @@ def _key_channels(action, ob, key_types, data_path, group_name, frames, values):
     if not num:
         return
     for index in range(len(values[0])):
-        fcurve = action.fcurve_ensure_for_datablock(ob, data_path, index=index, group_name=group_name)
+        
+        if bpy.app.version >= (5, 0, 0):
+            fcurve = action.fcurve_ensure_for_datablock(
+                ob, data_path, index=index, group_name=group_name
+            )
+        else:
+            fcurve = action.fcurve_ensure_for_datablock(
+                ob, data_path, index=index
+            )
+
+            if fcurve.group is None or fcurve.group.name != group_name:
+                from bpy_extras.anim_utils import action_get_channelbag_for_slot
+
+                channelbag = action_get_channelbag_for_slot(
+                    action, ob.animation_data.action_slot
+                )
+
+                group = channelbag.groups.get(group_name)
+                if group is None:
+                    group = channelbag.groups.new(group_name)
+
+                fcurve.group = group
+        
+        
         points = fcurve.keyframe_points
         if len(points):  # not expected on a new action: keep keyframe_insert()'s replace-on-same-frame behaviour
             for frame, value in zip(frames, values):
