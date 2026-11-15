@@ -181,6 +181,39 @@ def _strip_dot_suffix(name):
 # Append + dedup
 # ---------------------------------------------------------------------------
 
+def append_template_light():
+    # type: () -> bpy.types.Light
+    """
+    Appends the bundled "SWTOR_Gobo" Light data-block ONCE and returns it, with
+    its shared group node already deduped -- a pristine source for
+    copy_template_light(). The caller keeps it for the length of a batch (it
+    carries a fake user so nothing purges it) and must remove it afterwards
+    with bpy.data.lights.remove().
+
+    One library append costs around 100 ms; a batch used to pay it for every
+    distinct light (hundreds of them).
+    """
+    light = build_light_from_template(TEMPLATE_LIGHT_NAME + " (template)")
+    light.use_fake_user = True
+    return light
+
+
+def copy_template_light(template_light, name):
+    # type: (bpy.types.Light, str) -> bpy.types.Light
+    """
+    A new, independent Light for `name`, copied from append_template_light()'s
+    result: its own outer node tree and texture nodes (for the caller to
+    configure), the same shared inner group and default images every
+    appended copy ended up with after build_light_from_template()'s dedup.
+    Matches build_light_from_template()'s result, including the fake user it
+    leaves set for the caller to clear.
+    """
+    new_light = template_light.copy()
+    new_light.use_fake_user = True
+    new_light.name = name
+    return new_light
+
+
 def build_light_from_template(name):
     # type: (str) -> bpy.types.Light
     """

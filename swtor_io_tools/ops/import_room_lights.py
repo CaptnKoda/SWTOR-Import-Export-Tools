@@ -146,6 +146,9 @@ class _RealLightCache:
         self._by_key = {}   # cache key -> bpy.types.Light
         self._area_name = None  # label only, NOT part of the cache key -- see class docstring
         self._template_error = None  # sticky, see class docstring
+        # The pristine appended template every built light is copied from: appended
+        # once, on the first light that needs it, removed by release_template().
+        self._template_light = None
 
     def set_area_name(self, area_name):
         # type: (str) -> None
@@ -159,6 +162,20 @@ class _RealLightCache:
         """"light - <area name>" -- mirrors _LightCache.object_name()'s
         own naming/reasoning exactly, just for real lights."""
         return "light - %s" % (self._area_name or "Area")
+
+    def release_template(self):
+        """
+        Removes the pristine template Light append_template_light() made (its
+        default images, if no built light kept them, are left orphaned for the
+        final purge). Safe to call more than once; ImportAREA.execute() calls
+        it after the last light is built and again from its finally.
+        """
+        template, self._template_light = self._template_light, None
+        if template is not None:
+            try:
+                bpy.data.lights.remove(template)
+            except (ReferenceError, RuntimeError):
+                pass
 
     def needs_final_purge(self):
         # type: () -> bool
@@ -224,7 +241,9 @@ class _RealLightCache:
     def _build(self, light_info, warnings):
         # type: (object, list) -> bpy.types.Light
         name = "%s - Light" % (self._area_name or "Area")
-        light = light_templates.build_light_from_template(name)
+        if self._template_light is None:
+            self._template_light = light_templates.append_template_light()
+        light = light_templates.copy_template_light(self._template_light, name)
 
         # Eevee parity (plain properties -- Crunch's own call: "if
         # Eevee can't do it [via the node tree], there's nothing to be

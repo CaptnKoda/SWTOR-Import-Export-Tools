@@ -42,11 +42,6 @@ from bpy.types import Context, Image, ShaderNodeCustomGroup, UILayout
 from nodeitems_utils import NodeCategory, NodeItem
 
 
-# Detect Blender version
-major, minor, _ = bpy.app.version
-blender_version = major + minor / 10
-
-
 # Derived enums
 CREATURE = ('CREATURE', "Creature", "")
 EYE = ('EYE', "Eye", "")
@@ -228,12 +223,8 @@ def update_alpha_mode(self, context):
     # type: ("ShaderNodeHeroEngine", Context) -> None
     if context and context.space_data.type in {'NODE_EDITOR', 'PROPERTIES'}:
         mat = context.material
-        if blender_version < 4.2:
-            mat.blend_method = self.alpha_mode
-            mat.show_transparent_back = False
-        else:
-            mat.surface_render_method = "DITHERED"
-            mat.use_transparency_overlap = False
+        mat.surface_render_method = "DITHERED"
+        mat.use_transparency_overlap = False
 
     nd_SetAlphaMode = self.node_tree.nodes['SetAlphaMode']
     if self.alpha_mode == "BLEND":
@@ -249,10 +240,6 @@ def update_alpha_mode(self, context):
 
 def update_alpha_test_value(self, context):
     # type: ("ShaderNodeHeroEngine", Context) -> None
-    if context and context.space_data.type in {'NODE_EDITOR', 'PROPERTIES'}:
-        if blender_version < 4.2:  # RETIRE THIS OMCE THE NEW SETALPHAMODE NODE WORKS
-            context.material.alpha_threshold = self.alpha_test_value
-
     nd_SetAlphaMode = self.node_tree.nodes['SetAlphaMode']
     nd_SetAlphaMode.inputs[3].default_value = self.alpha_test_value
     

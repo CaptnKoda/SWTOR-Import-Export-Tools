@@ -41,7 +41,7 @@ from ..types.mat import (
     read_mat_summary,
     resolve_mat_path,
 )
-from ..types.shader_templates import has_swtor_shader_group
+from ..types.shader_templates import has_swtor_shader_group, template_copies
 
 
 # ---------------------------------------------------------------------------
@@ -246,26 +246,54 @@ def apply_materials_by_name_to_gr2_objects(object_names):
     same base name gets rebuilt instead.
     """
     results = []
-    for object_name in object_names:
-        ob = bpy.data.objects.get(object_name)
-        if ob is None or ob.type != 'MESH':
-            continue
+    # Every instance of a mesh shares its mesh data, and the slots are set ON that
+    # data, so a repeat instance has nothing left to do: (mesh, material names) ->
+    # that mesh's results, replayed for the repeats (a material built for the first
+    # instance counts as "already built" for the rest, exactly what asking again gave).
+    done_meshes = {}
+    # bpy.data.objects.get(name) is a linear scan of every object in the file (about
+    # half a millisecond with 16,000 of them), once per object here: one dictionary
+    # built up front does the same lookups instantly.
+    objects_by_name = {candidate.name: candidate for candidate in bpy.data.objects}
+    # One block so materials of a shader type are copied, not re-appended -- see
+    # shader_templates.template_copies().
+    with template_copies():
+        for object_name in object_names:
+            ob = objects_by_name.get(object_name)
+            if ob is None or ob.type != 'MESH':
+                continue
 
-        raw = ob.get("gr2_material_names")
-        if not raw:
-            continue
-        try:
-            original_names = json.loads(raw)
-        except (ValueError, TypeError):
-            continue
+            raw = ob.get("gr2_material_names")
+            if not raw:
+                continue
 
-        for slot_index, mat_name in enumerate(original_names):
-            if slot_index >= len(ob.data.materials):
-                break
-            material, result = _build_named_material(mat_name, ob.name)
-            results.append(result)
-            if material is not None:
-                ob.data.materials[slot_index] = material
+            mesh_key = (ob.data.name, raw)
+            earlier = done_meshes.get(mesh_key)
+            if earlier is not None:
+                for r in earlier:
+                    if r.status == "built":
+                        results.append(MaterialProcessResult(r.name, "skipped", "already built"))
+                    else:
+                        results.append(MaterialProcessResult(r.name, r.status, r.detail, list(r.missing_assets)))
+                continue
+
+            try:
+                original_names = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+
+            own = []
+            for slot_index, mat_name in enumerate(original_names):
+                if slot_index >= len(ob.data.materials):
+                    break
+                material, result = _build_named_material(mat_name, ob.name)
+                own.append(result)
+                if material is not None:
+                    ob.data.materials[slot_index] = material
+            results.extend(own)
+            # An "error" is retried for each repeat, as before; everything else is settled.
+            if not any(r.status == "error" for r in own):
+                done_meshes[mesh_key] = own
     return results
 
 
