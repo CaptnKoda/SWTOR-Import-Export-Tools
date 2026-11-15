@@ -180,7 +180,10 @@ def _filter_excluded_objects(objects, skip_game_engine_objects, skip_counts):
 
         if reason is not None:
             skip_counts[reason] += 1
-            bpy.data.objects.remove(ob, do_unlink=True)
+            # do_unlink=True scans every collection and scene in the file (about 5 ms with
+            # 16,000 objects). An object nothing uses yet -- every repeat instance a mesh
+            # cache hands out -- is in no collection, so there is nothing to unlink.
+            bpy.data.objects.remove(ob, do_unlink=bool(ob.users))
         else:
             kept.append(ob)
     return kept
@@ -360,6 +363,11 @@ class _LightBudget:
         self._total = 0
         self._collections = []
         self._exceeded = False
+        # Lights collections waiting to be excluded from the view layer. Excluding
+        # used to happen right here, one full view_layer.update() per file
+        # (~0.4 s each on a 220-file batch); flush() now does it all after a
+        # single update once the batch's load loop has finished.
+        self._pending = []
 
     def register(self, context, lights_collection):
         # type: (Any, Any) -> None
@@ -378,7 +386,7 @@ class _LightBudget:
             # Already over budget from an earlier file in this batch --
             # every subsequent file's lights collection gets excluded
             # too, without repeating the full warning every time.
-            self._exclude(context, lights_collection, announce=False)
+            self._pending.append(lights_collection)
             return
 
         if self._total > self._threshold:
@@ -391,22 +399,48 @@ class _LightBudget:
                 "batch will also be excluded automatically."
                 % (self._total, self._threshold, len(self._collections))
             )
-            for collection in self._collections:
-                self._exclude(context, collection, announce=False)
+            self._pending.extend(self._collections)
 
-    def _exclude(self, context, collection, announce):
+    def flush(self, context):
+        # type: (Any) -> None
+        """
+        Excludes every Lights collection queued by register(). Call once,
+        after the batch's load loop (execute() also calls it from its
+        finally, so an import that raised part-way still leaves the same
+        exclusions as before; it does nothing the second time).
+
+        ONE view_layer.update() first, then every exclusion: the update is
+        what evaluates each light object's matrix_world, and objects in an
+        excluded collection are no longer evaluated, so it has to come
+        before the exclusions -- but it never needed to run once per file.
+        Does nothing at all when the budget was never exceeded.
+        """
+        if not self._pending:
+            return
+        pending, self._pending = self._pending, []
+
         context.view_layer.update()
-        layer_collection = _find_layer_collection(context.view_layer.layer_collection, collection)
-        if layer_collection is not None:
-            layer_collection.exclude = True
-        else:
-            # Never silently do nothing -- see this same reasoning on
-            # the equivalent lookup failure this addon has hit before.
-            print(
-                "Area Assembler: couldn't find \"%s\"'s LayerCollection to exclude "
-                "it -- left visible. Please report this if it keeps happening."
-                % collection.name
-            )
+        # One walk of the view layer's collection tree instead of one search per
+        # collection (LayerCollection.name is its Collection's name).
+        by_name = {}
+        stack = [context.view_layer.layer_collection]
+        while stack:
+            layer_collection = stack.pop()
+            by_name[layer_collection.name] = layer_collection
+            stack.extend(layer_collection.children)
+
+        for collection in pending:
+            layer_collection = by_name.get(collection.name)
+            if layer_collection is not None:
+                layer_collection.exclude = True
+            else:
+                # Never silently do nothing -- see this same reasoning on
+                # the equivalent lookup failure this addon has hit before.
+                print(
+                    "Area Assembler: couldn't find \"%s\"'s LayerCollection to exclude "
+                    "it -- left visible. Please report this if it keeps happening."
+                    % collection.name
+                )
 
 
 def _lod_state(ob):
@@ -1151,9 +1185,15 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
                 target_collection = _ensure_lights_collection()
             else:
                 target_collection = _ensure_leaf_collection(element_category, ob.type == 'EMPTY')
-            if target_collection not in ob.users_collection:
+            # ob.users_collection scans EVERY collection in the file on each access, so
+            # it is read once here (not twice), and not at all for an object with no
+            # users: being in a collection always counts as a user, so users == 0
+            # means "in no collection" (that is every repeat instance a mesh cache
+            # hands out -- only a fresh import arrives already linked).
+            current_collections = list(ob.users_collection) if ob.users else []
+            if target_collection not in current_collections:
                 target_collection.objects.link(ob)
-            for existing in list(ob.users_collection):
+            for existing in current_collections:
                 if existing is not target_collection:
                     existing.objects.unlink(ob)
         total_objects.extend(objects)
@@ -1564,6 +1604,7 @@ class ImportAREA(bpy.types.Operator):
                     succeeded.append(path)
                 else:
                     failed.append(path)
+            light_budget.flush(context)
             batch_elapsed_time = time.time() - batch_start_time
 
             # Every load() has finished, so every instantiate() of the batch has
@@ -1572,6 +1613,8 @@ class ImportAREA(bpy.types.Operator):
             # that purge can still reclaim the meshes of excluded objects.
             mesh_cache.release()
             fxspec_mesh_cache.release()
+
+            real_light_cache.release_template()
 
             if real_light_cache.needs_final_purge():
                 # The one safe point to reclaim everything real-light
@@ -1608,6 +1651,11 @@ class ImportAREA(bpy.types.Operator):
             # Runs even if the import raised part-way through.
             mesh_cache.release()           # idempotent -- covers the raised-part-way case
             fxspec_mesh_cache.release()
+            try:
+                light_budget.flush(context)    # no-op after the normal flush above
+            except Exception as exc:  # noqa: BLE001 -- never mask the original error
+                print("Area Assembler: couldn't exclude the Lights collections: %s" % exc)
+            real_light_cache.release_template()   # no-op after the normal release above
             hms_batch.finish(context)
             for level, message in hms_batch.notices:
                 self.report({level}, message)

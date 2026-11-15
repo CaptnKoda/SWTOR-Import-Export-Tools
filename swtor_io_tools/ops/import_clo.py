@@ -36,7 +36,6 @@ import os
 from array import array
 from typing import Optional, Set
 
-from bpy import app
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, StringProperty
 from bpy.types import Context, Object, Operator, OperatorFileListElement
 from bpy_extras.io_utils import ImportHelper
@@ -58,10 +57,7 @@ class ImportCLO(Operator, ImportHelper):
     )
     bl_options = {'UNDO'}
 
-    if app.version < (2, 82, 0):
-        directory = StringProperty(subtype='DIR_PATH')
-    else:
-        directory: StringProperty(subtype='DIR_PATH')
+    directory: StringProperty(subtype='DIR_PATH')
 
     filename_ext = ".clo"
 

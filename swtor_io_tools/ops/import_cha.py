@@ -535,9 +535,19 @@ def bind_objects_to_armature(objects, armature, single_armature_only=True):
 
         # Create a parent relationship. Don't use a parent_type of
         # 'ARMATURE' -- the modifier above is already doing that job.
+        #
+        # The inverse must come from matrix_basis, NOT matrix_world: the
+        # GR2 importers set the Y-up -> Z-up X=90 rotation through
+        # ob.matrix_local, and matrix_world isn't refreshed until a
+        # depsgraph evaluation, which hasn't run yet at this point. Reading
+        # it here gave identity, so the armature's X=90 rotation was
+        # stacked on top of each mesh's own X=90 and the meshes ended up
+        # lying down. matrix_basis is computed from the object's current
+        # loc/rot/scale properties, and equals the world matrix for a
+        # parentless object (which the imported armature is).
         obj.parent = armature
-        obj.matrix_parent_inverse = armature.matrix_world.inverted()
-        
+        obj.matrix_parent_inverse = armature.matrix_basis.inverted()
+
         # Enable Preserve Volume on Armature Modifier by Default
         obj.modifiers["Armature"].use_deform_preserve_volume = True
 
