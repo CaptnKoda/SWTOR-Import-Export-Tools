@@ -41,11 +41,19 @@ How the bones are built
   Head positions and rest-pose deformation are unchanged; only the axes'
   names differ. Bones point down their limbs as plain Stick bones, and
   Blender's X-Mirror works on 26 of bmnnew's 28 Left/Right pairs (1 of 28
-  with the file's axes). The 90° turn is stored on every bone
+  with the file's axes). Each bone's turn is stored on it
   ('gr2_rest_correction') and the armature is flagged
   'gr2_bone_orientation' = 'LIMB'.
   .jba animations are authored against the file's axes: ops/import_jba.py
   undoes the turn for the math and reapplies it to the result.
+
+• Attachment bones (Left/RightWeapon, socket_*, attach_*: see
+  ATTACHMENT_PREFIXES) are NOT turned: their 'gr2_rest_correction' is the
+  identity. The game places weapons and other attached meshes directly in
+  these bones' frames, so a mesh given a Copy Transforms or Child Of
+  constraint to one of them sits exactly as in the game. Turned, it would be
+  90° off about the bone's Z (checked with blaster_low05_a02_v02 on bmnnew's
+  RightWeapon during cb_pistol_idle_1: 90.0° turned, 0.0° unturned).
 
 • Each bone's rest matrix is set directly with EditBone.matrix, so its head
   position and all three local axes (including roll) are exactly the
@@ -158,6 +166,14 @@ LIMB_AXIS_REMAP = Matrix(((0.0, 1.0, 0.0, 0.0),
                           (0.0, 0.0, 1.0, 0.0),
                           (0.0, 0.0, 0.0, 1.0)))
 
+# Attachment bones keep the file's own axes (no LIMB_AXIS_REMAP): the game
+# places weapons and other attached meshes directly in these bones' frames
+# (a weapon .gr2's origin is its grip, its barrel runs along +Y), so with the
+# file's axes a Copy Transforms / Child Of constraint to the bone places the
+# mesh exactly as the game does. Turned, it would be 90° off about the
+# bone's Z. They're dots, so pointing them down a limb would gain nothing.
+ATTACHMENT_PREFIXES = ("socket_", "attach_")
+
 # A body bone reaches its child when the child lies within this angle of the
 # bone's own (remapped) axis, else it's a dot.
 LIMB_MAX_CHILD_ANGLE = 60.0
@@ -257,6 +273,18 @@ def _bone_collection_names(names):
     return result
 
 
+def _rest_corrections(names):
+    # type: (List[str]) -> List[Matrix]
+    """
+    Each bone's rest correction C (Blender rest = file rest @ C):
+    LIMB_AXIS_REMAP, except for attachment bones (see ATTACHMENT_PREFIXES),
+    which keep the file's axes.
+    """
+    identity = Matrix.Identity(4)
+    return [identity if name in WEAPON_NAMES or name.startswith(ATTACHMENT_PREFIXES) else LIMB_AXIS_REMAP
+            for name in names]
+
+
 def _limb_lengths(names, parents, rest):
     # type: (List[str], List[int], List[Matrix]) -> List[float]
     """
@@ -348,16 +376,16 @@ def _report(operator, level, message):
         print(f"{level}: {message}")
 
 
-def _accuracy_summary(bones, ob, blender_names, rotation, scale, mirror_count):
-    # type: (list, bpy.types.Object, List[str], Matrix, float, int) -> str
+def _accuracy_summary(bones, ob, blender_names, corrections, rotation, scale, mirror_count):
+    # type: (list, bpy.types.Object, List[str], List[Matrix], Matrix, float, int) -> str
     """Checks the built armature against the file's own matrices (scaled/rotated as imported)."""
     max_rest_error = 0.0
-    for bone, blender_name in zip(bones, blender_names):
+    for bone, blender_name, correction in zip(bones, blender_names, corrections):
         b = ob.data.bones[blender_name]
         if "gr2_mirror_axis" in b:
             continue
         expected = _convert(_matrix_from_column_major(bone.root_to_bone).inverted_safe(), rotation, scale)
-        expected = expected @ LIMB_AXIS_REMAP
+        expected = expected @ correction
         actual = b.matrix_local
         max_rest_error = max(max_rest_error, max(abs(actual[r][c] - expected[r][c])
                                                  for r in range(4) for c in range(4)))
@@ -468,7 +496,8 @@ def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, ope
         mirror_axes.append(axis)
 
     rotation, scale = _import_conversion(apply_axis_conversion, scale_object, scale_factor)
-    rest = [_convert(matrix, rotation, scale) @ LIMB_AXIS_REMAP for matrix in rest]
+    corrections = _rest_corrections(names)
+    rest = [_convert(matrix, rotation, scale) @ correction for matrix, correction in zip(rest, corrections)]
     lengths = _limb_lengths(names, parents, rest)
 
     # Create the armature object
@@ -516,8 +545,7 @@ def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, ope
     _refine_rolls(armature, blender_names, rest)
 
     # Per-bone data
-    rest_correction = [v for row in LIMB_AXIS_REMAP.to_3x3() for v in row]
-    for index, (bone, axis, blender_name) in enumerate(zip(bones, mirror_axes, blender_names)):
+    for index, (bone, axis, blender_name, correction) in enumerate(zip(bones, mirror_axes, blender_names, corrections)):
         b = armature.bones[blender_name]
         if blender_name != bone.name:
             b["gr2_name"] = bone.name
@@ -528,7 +556,7 @@ def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, ope
             b["gr2_mirror_axis"] = axis
         # rest = file rest @ this (3x3, row by row), for tools such as
         # ops/import_jba.py to convert between the two
-        b["gr2_rest_correction"] = rest_correction
+        b["gr2_rest_correction"] = [v for row in correction.to_3x3() for v in row]
 
     # Bone collections
     collections = {}
@@ -564,7 +592,7 @@ def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, ope
     _apply_character_spec(ob, armature, filepath, operator)
 
     mirror_count = sum(1 for axis in mirror_axes if axis)
-    summary = _accuracy_summary(bones, ob, blender_names, rotation, scale, mirror_count)
+    summary = _accuracy_summary(bones, ob, blender_names, corrections, rotation, scale, mirror_count)
     print(f"ARMATURE: '{filepath}': {summary}")
     _report(operator, 'INFO', f"Imported '{ob.name}': {summary}")
 
